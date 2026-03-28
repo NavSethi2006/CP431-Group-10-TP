@@ -1,157 +1,175 @@
-
-#include "glut.h"
+#include <GL/glew.h>
+#include <GL/glut.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+GLuint program;
 
-static unsigned char *pixel_data = NULL;
-static int width = 0, height = 0;
-static GLuint texture_id = 0;
-static char *filename = NULL;
+double min_re = -1.5, max_re = 1.5;
+double min_im = -1.5, max_im = 1.5;
 
-// Color map - map escape index (0..255) to RGB
-void get_color(unsigned char index, unsigned char *r, unsigned char *g, unsigned char *b) {
-    if(index == 0) {
-        *r=0; *g=0; *b=0;
-        return;
-    }
+double zoom_velocity = 0.0;
+double mouse_x = 0.5, mouse_y = 0.5;
 
-    float t = (float) index / 255.0f;
-    *r = (unsigned char)(sin(t * 2.0 * M_PI) * 127 + 128);
-    *g = (unsigned char)(sin((t + 1.0/3.0) * 2.0 * M_PI) * 127 + 128);
-    *b = (unsigned char)(sin((t + 2.0/3.0) * 2.0 * M_PI) * 127 + 128);
+int keys[256] = {0};
+
+// ===== SHADERS =====
+const char* vertex_shader_src =
+"#version 120\n"
+"void main() { gl_Position = gl_Vertex; }";
+
+const char* fragment_shader_src =
+"#version 120\n"
+"uniform vec2 minC;\n"
+"uniform vec2 maxC;\n"
+"uniform vec2 resolution;\n"
+"uniform vec2 c;\n"
+"\n"
+"void main() {\n"
+"    vec2 uv = gl_FragCoord.xy / resolution;\n"
+"    float x = mix(minC.x, maxC.x, uv.x);\n"
+"    float y = mix(minC.y, maxC.y, uv.y);\n"
+"\n"
+"    vec2 z = vec2(x,y);\n"
+"\n"
+"    int i;\n"
+"    int max_iter = 500;\n"
+"\n"
+"    for(i = 0; i < max_iter; i++) {\n"
+"        if(dot(z,z) > 4.0) break;\n"
+"        z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;\n"
+"    }\n"
+"\n"
+"    float t = float(i)/float(max_iter);\n"
+"\n"
+"    vec3 col = vec3(\n"
+"        pow(t,0.3),\n"
+"        pow(t,0.5),\n"
+"        pow(t,0.8)\n"
+"    );\n"
+"\n"
+"    gl_FragColor = vec4(col,1.0);\n"
+"}";
+
+// ===== SHADER UTILS =====
+GLuint compile_shader(GLenum type, const char* src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    return s;
 }
 
-// Build an RGB texture from the escape index data
-void build_texture(void) {
-    unsigned char *rgb_data = malloc(width * height * 3);
-    if(!rgb_data) {
-        fprintf(stderr, "Failed to allocate RGB buffer\n");
-        exit(1);
-    }
+void init_shader() {
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, vertex_shader_src);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fragment_shader_src);
 
-    for(int i = 0; i < width * height; i++) {
-        unsigned char r, g, b;
-        get_color(pixel_data[i], &r, &g, &b);
-        rgb_data[i*3 + 0] = r;
-        rgb_data[i*3 + 1] = g;
-        rgb_data[i*3 + 2] = b;
-    }
-
-    glGenTextures(1, &texture_id);
-    glBindTexture(GL_TEXTURE_2D, texture_id);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb_data);
-    free(rgb_data);
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
 }
 
-// Read the binary file. Returns 0 on success, 1 on error
-int read_data_file(const char *fname) {
-    FILE *f = fopen(fname, "rb");
-    if (!f) {
-        perror("Cannot open file");
-        return 1;
-    }
-    // waiting to see how the data files are formatted
-
-}
-
-// Saves the current opengl window as a jpeg
-void save_jpeg(const char *outfile) {
-    // Read pixels from the frame buffer
-    unsigned char *pixels = malloc(width * height * 3);
-    if(pixels) {
-        fprintf(stderr, "Out of memory to take a screenshot\n");
-        return;
-    }
-    glReadPixels(0,0,width,height,GL_RGB,GL_UNSIGNED_BYTE,pixels);
-
-    // flip verticall because opengl's origin is bottom-left
-    unsigned char *flipped = malloc(width * height * 3);
-    for(int i = 0; i < height; i++) {
-        memcpy(flipped + i * width * 3, pixels + (height - 1 - i)*width*3, width*3);
-    }
-
-    // write jpeg
-    if(stbi_write_jpg(outfile, width, height, 3, flipped, 90) == 0) {
-        fprintf(stderr, "Failed to write jpeg file %s\n", outfile);
-    } else {
-        printf("Saved %s\n", outfile);
-    }
-
-    // free pointers after done
-    free(pixels);
-    free(flipped);
-}
-
-// Display callback
-void display(void) {
+// ===== RENDER =====
+void display() {
     glClear(GL_COLOR_BUFFER_BIT);
-    glBindTexture(GL_TEXTURE_2D, texture_id);
-    glEnable(GL_TEXTURE_2D);
+
+    glUseProgram(program);
+
+    int w = glutGet(GLUT_WINDOW_WIDTH);
+    int h = glutGet(GLUT_WINDOW_HEIGHT);
+
+    glUniform2f(glGetUniformLocation(program,"minC"), min_re, min_im);
+    glUniform2f(glGetUniformLocation(program,"maxC"), max_re, max_im);
+    glUniform2f(glGetUniformLocation(program,"resolution"), w, h);
+    glUniform2f(glGetUniformLocation(program,"c"), -0.7, 0.27015);
 
     glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
-    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, -1.0f);
-    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, 1.0f);
-    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, 1.0f);
+    glVertex2f(-1,-1);
+    glVertex2f( 1,-1);
+    glVertex2f( 1, 1);
+    glVertex2f(-1, 1);
     glEnd();
 
-    glDisable(GL_TEXTURE_2D);
     glutSwapBuffers();
-
-    static int saved = 0;
-    if(!saved) {
-        char outfile[256];
-        snprintf(outfile, sizeof(outfile), "%s.jpg", filename ? filename : "julia");
-        save_jpeg(outfile);
-        saved = 1;
-    }
 }
 
-// reshape callback - maintain aspect ratio and set viewport
-void reshape(int w, int h) {
-    glViewport(0,0,w,h);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
-    glMatrixMode(GL_MODELVIEW);
+// ===== CONTROLS =====
+void zoom_to_mouse(double factor) {
+    double cx = min_re + mouse_x * (max_re - min_re);
+    double cy = min_im + mouse_y * (max_im - min_im);
+
+    double width = (max_re - min_re) * factor;
+    double height = (max_im - min_im) * factor;
+
+    min_re = cx - width * mouse_x;
+    max_re = min_re + width;
+
+    min_im = cy - height * mouse_y;
+    max_im = min_im + height;
 }
 
-void keyboard(unsigned char key, int x, int y) {
-    if(key=='q' || key == 27) exit(0);
+void motion(int x, int y) {
+    int w = glutGet(GLUT_WINDOW_WIDTH);
+    int h = glutGet(GLUT_WINDOW_HEIGHT);
+
+    mouse_x = (double)x / w;
+    mouse_y = 1.0 - (double)y / h;
 }
 
-int main(int argc, char **argv) {
-    if(argc < 2) {
-        fprintf(stderr, "Usage: %s <datafile.bin>\n", argv[0]);
-        return 1;
-    }
-    filename = argv[1];
+void mouse(int button, int state, int x, int y) {
+    if(state != GLUT_DOWN) return;
 
-    if(read_data_file(filename) != 0) {
-        return 1;
+    if(button == 3) zoom_velocity -= 0.05;
+    if(button == 4) zoom_velocity += 0.05;
+}
+
+void key_down(unsigned char key, int x, int y) {
+    keys[key] = 1;
+    if(key == 27) exit(0);
+}
+
+void key_up(unsigned char key, int x, int y) {
+    keys[key] = 0;
+}
+
+void idle() {
+    int changed = 0;
+
+    // WASD pan
+    if(keys['w']) { min_im += 0.02; max_im += 0.02; changed=1; }
+    if(keys['s']) { min_im -= 0.02; max_im -= 0.02; changed=1; }
+    if(keys['a']) { min_re -= 0.02; max_re -= 0.02; changed=1; }
+    if(keys['d']) { min_re += 0.02; max_re += 0.02; changed=1; }
+
+    // smooth zoom
+    if(fabs(zoom_velocity) > 0.001) {
+        zoom_to_mouse(1.0 + zoom_velocity);
+        zoom_velocity *= 0.85;
+        changed = 1;
     }
 
+    if(changed) glutPostRedisplay();
+}
+
+// ===== MAIN =====
+int main(int argc, char** argv) {
     glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_RGB | GLUT_DOUBLE);
-    glutInitWindowSize(width, height);
-    glutCreateWindow("Julia Set Viewer");
-    glutReshapeFunc(reshape);
-    glutDisplayFunc(display);
-    glutKeyboardFunc(keyboard);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(800,800);
+    glutCreateWindow("Julia Explorer");
 
-    build_texture();
+    glewInit();
+
+    init_shader();
+
+    glutDisplayFunc(display);
+    glutPassiveMotionFunc(motion);
+    glutMouseFunc(mouse);
+    glutKeyboardFunc(key_down);
+    glutKeyboardUpFunc(key_up);
+    glutIdleFunc(idle);
 
     glutMainLoop();
-
-    free(pixel_data);
-    glDeleteTextures(1, &texture_id);
-
     return 0;
 }
