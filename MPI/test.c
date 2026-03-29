@@ -1,23 +1,21 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <mpi.h>
 #include <math.h>
-#include <time.h>
 #include <string.h>
-
-
-// julia sets 
 #include <complex.h>
+#include <sys/stat.h>
+#include <errno.h>
+
 #define MAX_ITERATIONS 100
 #define THRESHOLD 2.0
-#define WIDTH 1000
-#define HEIGHT 1000
-#define CHUNK_SIZE 10
+#define WIDTH 100000
+#define HEIGHT 100000
+#define CHUNK_SIZE 2048
 #define TAG_WORK 1
 #define TAG_RESULT_META 2
-#define TAG_RESULT_DATA 3
 #define TAG_STOP 4
-
 
 int compute_julia_value(double x, double y) {
     double complex z = x + y * I;
@@ -31,94 +29,66 @@ int compute_julia_value(double x, double y) {
     return MAX_ITERATIONS;
 }
 
-void write_julia_set_to_file(int *julia_set, int width, int height) {
-    FILE *file = fopen("julia_set.bin", "wb");
+
+
+void ensure_output_dir(void) {
+    if (mkdir("tiles", 0777) != 0 && errno != EEXIST) {
+        perror("Failed to create tiles directory");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+void write_manifest_file(void) {
+    FILE *file = fopen("tiles/manifest.txt", "w");
     if (file == NULL) {
-        perror("Failed to open julia_set.bin");
-        return;
+        perror("Failed to open tiles/manifest.txt");
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    fwrite(&width, sizeof(int), 1, file);
-    fwrite(&height, sizeof(int), 1, file);
-    fwrite(julia_set, sizeof(int), width * height, file);
+    fprintf(file, "WIDTH %d\n", WIDTH);
+    fprintf(file, "HEIGHT %d\n", HEIGHT);
+    fprintf(file, "CHUNK_SIZE %d\n", CHUNK_SIZE);
+    fprintf(file, "MAX_ITERATIONS %d\n", MAX_ITERATIONS);
     fclose(file);
 }
 
+FILE *open_rank_output_file(int rank) {
+    char path[256];
+    snprintf(path, sizeof(path), "tiles/rank_%d.bin", rank);
 
-
-//split data into rows 
-int *split_data_v1(int width, int height, int rank, int size) {
-    int base_rows = height / size;
-    int extra = height % size;
-
-    int local_rows, start_row;
-
-    if (rank < extra) {
-        local_rows = base_rows + 1;
-        start_row = rank * local_rows;
-    } else {
-        local_rows = base_rows;
-        start_row = rank * base_rows + extra;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) {
+        perror("Failed to open rank output file");
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    int end_row = start_row + local_rows;
+    return file;
+}
+int get_chunk_width(const int *chunk) {
+    return chunk[2] - chunk[0] + 1;
+}
 
-    int *result = (int *)malloc(2 * sizeof(int));
-    if (result == NULL) {
-        printf("Error: Failed to allocate memory for result\n");
-        MPI_Finalize();
-        return NULL;
-    }
+int get_chunk_height(const int *chunk) {
+    return chunk[3] - chunk[1] + 1;
+}
 
-    result[0] = start_row;
-    result[1] = end_row;
-    return result;
+int get_chunk_element_count(const int *chunk) {
+    return get_chunk_width(chunk) * get_chunk_height(chunk);
 }
 
 
-
-int *split_data_v2(int width, int height, int rank, int size) {
-    int chunks_x = floor((width + CHUNK_SIZE - 1) / CHUNK_SIZE);  
-    int chunks_y = floor((height + CHUNK_SIZE - 1) / CHUNK_SIZE); 
-    int extra_x = width % CHUNK_SIZE;
-    int extra_y = height % CHUNK_SIZE;
-    int total_chunks = chunks_x * chunks_y;
-
-    // If there are more processors than chunks, some ranks get nothing
-    if (rank >= total_chunks || rank >= size) {
-        return NULL;
+void write_chunk_to_rank_file(FILE *file, const int *chunk, const uint8_t *buffer) {
+    if (fwrite(chunk, sizeof(int), 5, file) != 5) {
+        perror("Failed to write chunk header to rank file");
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    int *result = (int *)malloc(4 * sizeof(int));
-    if (result == NULL) {
-        return NULL;
+    if (fwrite(buffer, sizeof(uint8_t), get_chunk_element_count(chunk), file) != (size_t)get_chunk_element_count(chunk)) {
+        perror("Failed to write chunk payload to rank file");
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // Map rank to 2D chunk index
-    int chunk_row = rank / chunks_x;
-    int chunk_col = rank % chunks_x;
-
-    int start_x = chunk_col * CHUNK_SIZE;
-    int start_y = chunk_row * CHUNK_SIZE;
-
-    // Handle edge chunks
-    int chunk_width = CHUNK_SIZE;
-    int chunk_height = CHUNK_SIZE;
-
-    if (start_x + chunk_width > width) {
-        chunk_width = width - start_x;
-    }
-
-    if (start_y + chunk_height > height) {
-        chunk_height = height - start_y;
-    }
-
-    result[0] = start_x;
-    result[1] = start_y;
-    result[2] = chunk_width;
-    result[3] = chunk_height;
-
-    return result;
+    fflush(file);
 }
 
 int *split_data_v3(int chunk_count) {
@@ -130,28 +100,17 @@ int *split_data_v3(int chunk_count) {
         return NULL;
     }
 
-    int *result = (int *)malloc(4 * sizeof(int));
+    int *result = (int *)malloc(5 * sizeof(int));
     if (result == NULL) {
         printf("Error: Failed to allocate memory for result\n");
-        MPI_Finalize();
-        exit(1);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    /*
-      Chunks are assigned in row-major order across the matrix.
-      Example for CHUNK_SIZE=2:
-      chunk 0 -> top-left chunk
-      chunk 1 -> next chunk to the right
-      chunk 2 -> next chunk to the right, etc.
-      Once a process finishes, the master can increment chunk_count and hand
-      out the next available chunk.
-    */
     int chunk_row = chunk_count / chunks_x;
     int chunk_col = chunk_count % chunks_x;
 
     int start_x = chunk_col * CHUNK_SIZE;
     int start_y = chunk_row * CHUNK_SIZE;
-
     int end_x = start_x + CHUNK_SIZE - 1;
     int end_y = start_y + CHUNK_SIZE - 1;
 
@@ -166,8 +125,7 @@ int *split_data_v3(int chunk_count) {
     result[1] = start_y;
     result[2] = end_x;
     result[3] = end_y;
-    printf("Chunk %d: from (%d, %d) to (%d, %d)\n", chunk_count, start_x, start_y, end_x, end_y);
-
+    result[4] = chunk_count;
     return result;
 }
 
@@ -177,19 +135,11 @@ int get_total_chunks(void) {
     return chunks_x * chunks_y;
 }
 
-int get_chunk_width(const int *chunk) {
-    return chunk[2] - chunk[0] + 1;
-}
 
-int get_chunk_height(const int *chunk) {
-    return chunk[3] - chunk[1] + 1;
-}
 
-int get_chunk_element_count(const int *chunk) {
-    return get_chunk_width(chunk) * get_chunk_height(chunk);
-}
 
-void compute_chunk(const int *chunk, int *buffer) {
+
+void compute_chunk(const int *chunk, uint8_t *buffer) {
     int start_x = chunk[0];
     int start_y = chunk[1];
     int end_x = chunk[2];
@@ -201,65 +151,32 @@ void compute_chunk(const int *chunk, int *buffer) {
             double real = -1.5 + (3.0 * x) / (WIDTH - 1);
             double imag = -1.5 + (3.0 * y) / (HEIGHT - 1);
             int value = compute_julia_value(real, imag);
-            buffer[(y - start_y) * chunk_width + (x - start_x)] = value;
+            buffer[(y - start_y) * chunk_width + (x - start_x)] = (uint8_t)value;
         }
     }
 }
 
-void store_chunk_in_matrix(int *julia_set, const int *chunk, const int *buffer) {
-    int start_x = chunk[0];
-    int start_y = chunk[1];
-    int end_x = chunk[2];
-    int end_y = chunk[3];
-    int chunk_width = end_x - start_x + 1;
-
-    for (int y = start_y; y <= end_y; y++) {
-        for (int x = start_x; x <= end_x; x++) {
-            julia_set[y * WIDTH + x] = buffer[(y - start_y) * chunk_width + (x - start_x)];
-        }
-    }
-}
-
-void print_julia_set(int *julia_set, int width, int height) {
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            printf("%d ", julia_set[y * width + x]);
-        }
-        printf("\n");
-    }
-}
-
-void print_local_julia_set(int *local_julia_set, int width, int height) {
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            printf("%d ", local_julia_set[y * width + x]);
-        }
-        printf("\n");
-    }
-}
 int main(int argc, char *argv[]) {
     int rank, size;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    FILE *rank_output_file = NULL;
+
+    ensure_output_dir();
+    rank_output_file = open_rank_output_file(rank);
 
     if (rank == 0) {
+        write_manifest_file();
+
         int total_chunks = get_total_chunks();
         int next_chunk = 0;
         int completed_chunks = 0;
 
-        int *julia_set = (int *)malloc(WIDTH * HEIGHT * sizeof(int));
-        if (julia_set == NULL) {
-            printf("Error: Failed to allocate memory for julia_set\n");
-            MPI_Finalize();
-            return 1;
-        }
-
-        /* Send one initial chunk to each worker if work remains. */
         for (int worker = 1; worker < size; worker++) {
             if (next_chunk < total_chunks) {
                 int *chunk = split_data_v3(next_chunk);
-                MPI_Send(chunk, 4, MPI_INT, worker, TAG_WORK, MPI_COMM_WORLD);
+                MPI_Send(chunk, 5, MPI_INT, worker, TAG_WORK, MPI_COMM_WORLD);
                 next_chunk++;
                 free(chunk);
             } else {
@@ -268,55 +185,38 @@ int main(int argc, char *argv[]) {
         }
 
         while (completed_chunks < total_chunks) {
-            /* Rank 0 also computes the next available chunk if there is one. */
             if (next_chunk < total_chunks) {
                 int *chunk = split_data_v3(next_chunk);
                 int element_count = get_chunk_element_count(chunk);
-                int *buffer = (int *)malloc(element_count * sizeof(int));
+                uint8_t *buffer = (uint8_t *)malloc((size_t)element_count * sizeof(uint8_t));
                 if (buffer == NULL) {
                     printf("Error: Failed to allocate memory for rank 0 chunk buffer\n");
                     free(chunk);
-                    free(julia_set);
-                    MPI_Finalize();
-                    return 1;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
                 }
 
                 next_chunk++;
                 compute_chunk(chunk, buffer);
-                store_chunk_in_matrix(julia_set, chunk, buffer);
+                write_chunk_to_rank_file(rank_output_file, chunk, buffer);
                 completed_chunks++;
 
                 free(buffer);
                 free(chunk);
             }
 
-            /* Process any completed worker results that are waiting. */
             int flag = 0;
             MPI_Status status;
             do {
                 MPI_Iprobe(MPI_ANY_SOURCE, TAG_RESULT_META, MPI_COMM_WORLD, &flag, &status);
                 if (flag) {
                     int worker = status.MPI_SOURCE;
-                    int chunk[4];
-                    MPI_Recv(chunk, 4, MPI_INT, worker, TAG_RESULT_META, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-                    int element_count = get_chunk_element_count(chunk);
-                    int *buffer = (int *)malloc(element_count * sizeof(int));
-                    if (buffer == NULL) {
-                        printf("Error: Failed to allocate memory for recv buffer\n");
-                        free(julia_set);
-                        MPI_Finalize();
-                        return 1;
-                    }
-
-                    MPI_Recv(buffer, element_count, MPI_INT, worker, TAG_RESULT_DATA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    store_chunk_in_matrix(julia_set, chunk, buffer);
+                    int finished_chunk[5];
+                    MPI_Recv(finished_chunk, 5, MPI_INT, worker, TAG_RESULT_META, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                     completed_chunks++;
-                    free(buffer);
 
                     if (next_chunk < total_chunks) {
                         int *next = split_data_v3(next_chunk);
-                        MPI_Send(next, 4, MPI_INT, worker, TAG_WORK, MPI_COMM_WORLD);
+                        MPI_Send(next, 5, MPI_INT, worker, TAG_WORK, MPI_COMM_WORLD);
                         next_chunk++;
                         free(next);
                     } else {
@@ -325,33 +225,14 @@ int main(int argc, char *argv[]) {
                 }
             } while (flag);
 
-            /* If rank 0 has no more local chunks to compute, block until workers finish. */
             if (next_chunk >= total_chunks && completed_chunks < total_chunks) {
-                int worker_chunk[4];
+                int finished_chunk[5];
                 MPI_Status recv_status;
-                MPI_Recv(worker_chunk, 4, MPI_INT, MPI_ANY_SOURCE, TAG_RESULT_META, MPI_COMM_WORLD, &recv_status);
-                int worker = recv_status.MPI_SOURCE;
-
-                int element_count = get_chunk_element_count(worker_chunk);
-                int *buffer = (int *)malloc(element_count * sizeof(int));
-                if (buffer == NULL) {
-                    printf("Error: Failed to allocate memory for blocking recv buffer\n");
-                    free(julia_set);
-                    MPI_Finalize();
-                    return 1;
-                }
-
-                MPI_Recv(buffer, element_count, MPI_INT, worker, TAG_RESULT_DATA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                store_chunk_in_matrix(julia_set, worker_chunk, buffer);
+                MPI_Recv(finished_chunk, 5, MPI_INT, MPI_ANY_SOURCE, TAG_RESULT_META, MPI_COMM_WORLD, &recv_status);
                 completed_chunks++;
-                free(buffer);
-
-                MPI_Send(NULL, 0, MPI_INT, worker, TAG_STOP, MPI_COMM_WORLD);
+                MPI_Send(NULL, 0, MPI_INT, recv_status.MPI_SOURCE, TAG_STOP, MPI_COMM_WORLD);
             }
         }
-
-        write_julia_set_to_file(julia_set, WIDTH, HEIGHT);
-        free(julia_set);
     } else {
         while (1) {
             MPI_Status status;
@@ -363,25 +244,27 @@ int main(int argc, char *argv[]) {
             }
 
             if (status.MPI_TAG == TAG_WORK) {
-                int chunk[4];
-                MPI_Recv(chunk, 4, MPI_INT, 0, TAG_WORK, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                int chunk[5];
+                MPI_Recv(chunk, 5, MPI_INT, 0, TAG_WORK, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
                 int element_count = get_chunk_element_count(chunk);
-                int *buffer = (int *)malloc(element_count * sizeof(int));
+                uint8_t *buffer = (uint8_t *)malloc((size_t)element_count * sizeof(uint8_t));
                 if (buffer == NULL) {
                     printf("Error: Failed to allocate memory for worker chunk buffer\n");
-                    MPI_Finalize();
-                    return 1;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
                 }
 
                 compute_chunk(chunk, buffer);
-                MPI_Send(chunk, 4, MPI_INT, 0, TAG_RESULT_META, MPI_COMM_WORLD);
-                MPI_Send(buffer, element_count, MPI_INT, 0, TAG_RESULT_DATA, MPI_COMM_WORLD);
+                write_chunk_to_rank_file(rank_output_file, chunk, buffer);
+                MPI_Send(chunk, 5, MPI_INT, 0, TAG_RESULT_META, MPI_COMM_WORLD);
                 free(buffer);
             }
         }
     }
 
+    if (rank_output_file != NULL) {
+        fclose(rank_output_file);
+    }
     MPI_Finalize();
     return 0;
 }
