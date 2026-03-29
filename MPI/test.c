@@ -12,8 +12,8 @@
 
 #define DEFAULT_MAX_ITERATIONS 255
 #define THRESHOLD 2.0
-#define DEFAULT_WIDTH 10000
-#define DEFAULT_HEIGHT 10000
+#define DEFAULT_WIDTH 100000
+#define DEFAULT_HEIGHT 100000
 #define DEFAULT_CHUNK_SIZE 4096
 #define TAG_WORK 1
 #define TAG_RESULT_META 2
@@ -68,6 +68,35 @@ int compute_julia_value(double x, double y) {
 
 void parse_args(int argc, char *argv[], int rank) {
 
+    if (argc >= 2) {
+        if (snprintf(output_dir, sizeof(output_dir), "%s", argv[1]) >= (int)sizeof(output_dir)) {
+            if (rank == 0) {
+                fprintf(stderr, "Output directory path is too long\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    if (argc >= 3) {
+        max_iterations = atoi(argv[2]);
+        if (max_iterations <= 0 || max_iterations > 255) {
+            if (rank == 0) {
+                fprintf(stderr, "max_iterations must be between 1 and 255\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    if (argc >= 4) {
+        julia_power = atoi(argv[3]);
+        if (julia_power != 2 && julia_power != 3) {
+            if (rank == 0) {
+                fprintf(stderr, "julia_power must be 2 or 3\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
 
     if (argc >= 5) {
         c_re = strtod(argv[4], NULL);
@@ -75,6 +104,36 @@ void parse_args(int argc, char *argv[], int rank) {
 
     if (argc >= 6) {
         c_im = strtod(argv[5], NULL);
+    }
+
+    if (argc >= 7) {
+        width = atoi(argv[6]);
+        if (width <= 0) {
+            if (rank == 0) {
+                fprintf(stderr, "width must be positive\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    if (argc >= 8) {
+        height = atoi(argv[7]);
+        if (height <= 0) {
+            if (rank == 0) {
+                fprintf(stderr, "height must be positive\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    if (argc >= 9) {
+        chunk_size = atoi(argv[8]);
+        if (chunk_size <= 0) {
+            if (rank == 0) {
+                fprintf(stderr, "chunk_size must be positive\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
 
 

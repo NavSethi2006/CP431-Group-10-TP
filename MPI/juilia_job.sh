@@ -41,12 +41,12 @@ echo "Compilation successful!"
 echo ""
 
 process_counts=(20 40 80)
-iteration_counts=255
-julia_powers=(2 3)
-constants=("0.0 0.0" "-1.0 0.0" "0.3 -0.4" "-0.1 0.8")
+iteration_count=255
+julia_powers=(2)
+constants=("0.35491 0.355")
 width=50000
 height=50000
-chunk_size=4096
+chunk_size=1024
 
 echo "Benchmark plan:"
 echo "  process counts: ${process_counts[*]}"
