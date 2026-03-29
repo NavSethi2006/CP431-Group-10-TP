@@ -8,11 +8,11 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     # Detect package manager
     if command -v pacman &> /dev/null; then
         echo "📦 Installing dependencies (Arch)..."
-        sudo pacman -Sy --noconfirm freeglut glew mesa
+        sudo pacman -Sy --noconfirm freeglut glew mesa libjpeg
     elif command -v apt &> /dev/null; then
         echo "📦 Installing dependencies (Ubuntu/Debian)..."
         sudo apt update
-        sudo apt install -y freeglut3-dev libglew-dev mesa-utils
+        sudo apt install -y freeglut3-dev libglew-dev mesa-utils libjpeg
     else
         echo "Unsupported package manager"
         exit 1
