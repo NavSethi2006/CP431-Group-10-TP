@@ -10,10 +10,10 @@
 
 // julia sets 
 #include <complex.h>
-#define MAX_ITERATIONS 100
+#define MAX_ITERATIONS 2000
 #define THRESHOLD 2.0
-#define WIDTH 100
-#define HEIGHT 100
+#define WIDTH 8000
+#define HEIGHT 8000
 #define CHUNK_SIZE 2
 
 
