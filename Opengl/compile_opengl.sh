@@ -12,14 +12,14 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     elif command -v apt &> /dev/null; then
         echo "📦 Installing dependencies (Ubuntu/Debian)..."
         sudo apt update
-        sudo apt install -y freeglut3-dev libglew-dev mesa-utils libjpeg
+        sudo apt install -y freeglut3-dev libglew-dev mesa-utils libjpeg-dev
     else
         echo "Unsupported package manager"
         exit 1
     fi
 
     echo "Compiling..."
-    gcc julia_viewer.c -lglut -lGLEW -lGL -lGLU -lm -o julia_viewer
+    gcc -DHAVE_LIBJPEG julia_viewer.c -lglut -lGLEW -lGL -lGLU -lm -ljpeg -o julia_viewer
 
     if [ $? -eq 0 ]; then
         echo "Build complete!"

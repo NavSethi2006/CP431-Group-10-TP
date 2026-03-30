@@ -198,6 +198,110 @@
      glEnableVertexAttribArray(0);
      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
  }
+
+
+ static int capture_framebuffer(int w, int h, unsigned char **pixels_out)
+{
+    unsigned char *buf = malloc((size_t)w * h * 3);
+    if (!buf) { fprintf(stderr, "screenshot: malloc failed\n"); return -1; }
+ 
+    /* read from the back buffer (what was last rendered) */
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, buf);
+ 
+    /* flip rows in-place: OpenGL y=0 is bottom, images y=0 is top */
+    unsigned char *row_tmp = malloc((size_t)w * 3);
+    if (!row_tmp) { free(buf); return -1; }
+ 
+    for (int y = 0; y < h / 2; y++) {
+        int    y2  = h - 1 - y;
+        size_t off1 = (size_t)y  * w * 3;
+        size_t off2 = (size_t)y2 * w * 3;
+        memcpy(row_tmp,      buf + off1, w * 3);
+        memcpy(buf + off1,   buf + off2, w * 3);
+        memcpy(buf + off2,   row_tmp,    w * 3);
+    }
+    free(row_tmp);
+ 
+    *pixels_out = buf;
+    return 0;
+}
+
+ static void make_screenshot_filename(char *buf, size_t bufsz)
+{
+#ifdef HAVE_LIBJPEG
+    const char *ext = "jpg";
+#else
+    const char *ext = "ppm";
+#endif
+    snprintf(buf, bufsz,
+             "julia_cx%+.6f_cy%+.6f_s%.2e_i%d.%s",
+             view_cx, view_cy, view_scale, max_iter, ext);
+}
+
+ #ifdef HAVE_LIBJPEG
+#include <jpeglib.h>
+ 
+static int write_jpeg(const char *fname, unsigned char *pixels, int w, int h, int quality)
+{
+    FILE *f = fopen(fname, "wb");
+    if (!f) { perror("fopen jpeg"); return -1; }
+ 
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr       jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, f);
+ 
+    cinfo.image_width      = w;
+    cinfo.image_height     = h;
+    cinfo.input_components = 3;
+    cinfo.in_color_space   = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+ 
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW row = pixels + cinfo.next_scanline * w * 3;
+        jpeg_write_scanlines(&cinfo, &row, 1);
+    }
+ 
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(f);
+    return 0;
+}
+#endif /* HAVE_LIBJPEG */
+ 
+static int write_ppm(const char *fname, unsigned char *pixels, int w, int h)
+{
+    FILE *f = fopen(fname, "wb");
+    if (!f) { perror("fopen ppm"); return -1; }
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    fwrite(pixels, 1, (size_t)w * h * 3, f);
+    fclose(f);
+    return 0;
+}
+
+static void take_screenshot(void)
+{
+    unsigned char *pixels = NULL;
+    if (capture_framebuffer(win_w, win_h, &pixels) != 0) return;
+ 
+    char fname[512];
+    make_screenshot_filename(fname, sizeof(fname));
+ 
+    int ok;
+#ifdef HAVE_LIBJPEG
+    ok = write_jpeg(fname, pixels, win_w, win_h, 95);
+    if (ok == 0) printf("Saved JPEG : %s\n", fname);
+#else
+    ok = write_ppm(fname, pixels, win_w, win_h);
+    if (ok == 0) printf("Saved PPM  : %s  (compile with -DHAVE_LIBJPEG for JPEG)\n", fname);
+#endif
+ 
+    free(pixels);
+}
  
  static void load_bin(const char *fname)
  {
@@ -264,7 +368,7 @@
      keys[(int)k] = 1;
      if (k == 27) exit(0);
      if (k=='r'||k=='R') { reset_view(); glutPostRedisplay(); }
-     if (k=='j'||k=='J') { save_screenshot("julia_screenshot.jpg"); }
+     if (k=='j'||k=='J') { take_screenshot(); }
      if (k=='+'||k=='=') { max_iter=(int)(max_iter*1.5); printf("max_iter=%d\n",max_iter); glutPostRedisplay(); }
      if (k=='-')          { max_iter=max_iter>64?(int)(max_iter/1.5):64; printf("max_iter=%d\n",max_iter); glutPostRedisplay(); }
  }
