@@ -66,6 +66,8 @@ int compute_julia_value(double x, double y) {
     return max_iterations;
 }
 
+// Parses the arguments
+
 void parse_args(int argc, char *argv[], int rank) {
 
     if (argc >= 2) {
@@ -150,8 +152,9 @@ void parse_args(int argc, char *argv[], int rank) {
     }
 }
 
+
 // Ensures the output directory exists and is writable
-// Uses MPI_Barrier to ensure all processes have reached this point
+// Uses MPI_Barrier to ensure all processes have reached this point 
 
 void ensure_output_dir(int rank) {
     if (rank == 0) {
@@ -396,19 +399,16 @@ int main(int argc, char *argv[]) {
 
     FILE *rank_output_file = NULL;
     parse_args(argc, argv, rank);
-    if (rank == 0) {
-        printf("Usage: ./main [output_dir] [max_iterations 1-255] [julia_power 2|3] [c_re] [c_im] [width] [height] [chunk_size]\n");
-        printf("Example q_c with 60 MPI processes: mpirun -np 60 ./main run_q2 255 2 0.3 -0.4 50000 50000 4096\n");
-        printf("Example t_c with 60 MPI processes: mpirun -np 60 ./main run_q3 255 3 -0.1 0.8 50000 50000 4096\n");
-    }
 
     // Ensures the output directory exists and is writable
     ensure_output_dir(rank);
 
     // Opens the output file for the given rank
     rank_output_file = open_rank_output_file(rank);
+
     // Waits for all processes to reach this point
     MPI_Barrier(MPI_COMM_WORLD);
+
     // Starts the timer for the run
     run_start = MPI_Wtime();
 
@@ -418,32 +418,28 @@ int main(int argc, char *argv[]) {
 
         // Gets the total number of chunks
         int total_chunks = get_total_chunks();
-        // Initializes the next chunk and completed chunks to 0
         int next_chunk = 0;
         int completed_chunks = 0;
 
-        // Sends the work to the workers
+        // Rank 0 acts purely as the scheduler so workers stay fed with work.
+        // This avoids the master spending long periods computing while workers sit idle.
         for (int worker = 1; worker < size; worker++) {
             if (next_chunk < total_chunks) {
                 int *chunk = split_data_v3(next_chunk);
-                // Sends the chunk to the worker
                 MPI_Send(chunk, 5, MPI_INT, worker, TAG_WORK, MPI_COMM_WORLD);
                 next_chunk++;
                 free(chunk);
             } else {
-                // Sends the stop signal to the worker
                 MPI_Send(NULL, 0, MPI_INT, worker, TAG_STOP, MPI_COMM_WORLD);
             }
         }
 
-        // Processes the chunks
-        while (completed_chunks < total_chunks) {
-            // If there are more chunks to process, splits the data into chunks
-            if (next_chunk < total_chunks) {
+        // If there are no workers, rank 0 must compute everything locally.
+        if (size == 1) {
+            while (next_chunk < total_chunks) {
                 int *chunk = split_data_v3(next_chunk);
-                // Gets the number of elements in the chunk
                 size_t element_count = get_chunk_element_count(chunk);
-                // Allocates memory for the buffer
+
                 uint8_t *buffer = (uint8_t *)malloc(element_count * sizeof(uint8_t));
                 if (buffer == NULL) {
                     printf("Error: Failed to allocate memory for rank 0 chunk buffer\n");
@@ -451,89 +447,67 @@ int main(int argc, char *argv[]) {
                     MPI_Abort(MPI_COMM_WORLD, 1);
                 }
 
-                next_chunk++;
                 double compute_start = MPI_Wtime();
-                // Computes the chunk
                 compute_chunk(chunk, buffer);
                 local_stats.compute_seconds += MPI_Wtime() - compute_start;
 
                 double io_start = MPI_Wtime();
-                // Writes the chunk to the rank file
                 write_chunk_to_rank_file(rank_output_file, chunk, buffer);
                 local_stats.io_seconds += MPI_Wtime() - io_start;
 
-                // Updates the local stats
                 local_stats.chunks_computed++;
                 local_stats.bytes_written += (unsigned long long)(5 * sizeof(int) + element_count * sizeof(uint8_t));
                 completed_chunks++;
+                next_chunk++;
 
                 free(buffer);
                 free(chunk);
             }
-
-            // Checks if there are any results from the workers
-            int flag = 0;
-            // Initializes the status to 0
-            MPI_Status status;
-            do {
-                // Checks if there are any results from the workers
-                MPI_Iprobe(MPI_ANY_SOURCE, TAG_RESULT_META, MPI_COMM_WORLD, &flag, &status);
-                // If there are results from the workers, receives the results
-                if (flag) {
-                    // Gets the worker that sent the results
-                    int worker = status.MPI_SOURCE;
-                    // Initializes the finished chunk to 0
-                    int finished_chunk[5];
-                    MPI_Recv(finished_chunk, 5, MPI_INT, worker, TAG_RESULT_META, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    // Updates the completed chunks
-                    completed_chunks++;
-
-                    if (next_chunk < total_chunks) {
-                        // Splits the data into chunks
-                        int *next = split_data_v3(next_chunk);
-                        // Sends the chunk to the worker
-                        MPI_Send(next, 5, MPI_INT, worker, TAG_WORK, MPI_COMM_WORLD);
-                        next_chunk++;
-                        free(next);
-                    } else {
-                        // Sends the stop signal to the worker
-                        MPI_Send(NULL, 0, MPI_INT, worker, TAG_STOP, MPI_COMM_WORLD);
-                    }
-                }
-            } while (flag);
-
-            if (next_chunk >= total_chunks && completed_chunks < total_chunks) {
-                // Receives the results from the worker
+        } else {
+            while (completed_chunks < total_chunks) {
                 int finished_chunk[5];
                 MPI_Status recv_status;
+
                 MPI_Recv(finished_chunk, 5, MPI_INT, MPI_ANY_SOURCE, TAG_RESULT_META, MPI_COMM_WORLD, &recv_status);
-                // Updates the completed chunks
                 completed_chunks++;
-                MPI_Send(NULL, 0, MPI_INT, recv_status.MPI_SOURCE, TAG_STOP, MPI_COMM_WORLD);
+
+                if (next_chunk < total_chunks) {
+                    int *next = split_data_v3(next_chunk);
+                    MPI_Send(next, 5, MPI_INT, recv_status.MPI_SOURCE, TAG_WORK, MPI_COMM_WORLD);
+                    next_chunk++;
+                    free(next);
+                } else {
+                    MPI_Send(NULL, 0, MPI_INT, recv_status.MPI_SOURCE, TAG_STOP, MPI_COMM_WORLD);
+                }
             }
         }
+
+    // If the rank is not 0, processes the chunks until the stop signal is received
     } else {
         // Processes the chunks until the stop signal is received
         while (1) {
-            // Checks if there are any results from the master
+           
             MPI_Status status;
             // Probes for any results from the master
             MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
             // If the stop signal is received, breaks the loop
             if (status.MPI_TAG == TAG_STOP) {
+                // Receives the stop signal from the master
                 MPI_Recv(NULL, 0, MPI_INT, 0, TAG_STOP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 break;
             }
-            // If the work signal is received, receives the work
+            // If the work signal is received, receives the chunk from the master
             if (status.MPI_TAG == TAG_WORK) {
-                // Initializes the chunk to 0
+
                 int chunk[5];
+
                 // Receives the chunk from the master
                 MPI_Recv(chunk, 5, MPI_INT, 0, TAG_WORK, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
                 // Gets the number of elements in the chunk
                 size_t element_count = get_chunk_element_count(chunk);
+
                 // Allocates memory for the buffer
                 uint8_t *buffer = (uint8_t *)malloc(element_count * sizeof(uint8_t));
                 if (buffer == NULL) {
@@ -543,19 +517,23 @@ int main(int argc, char *argv[]) {
 
                 // Starts the timer for the compute
                 double compute_start = MPI_Wtime();
+
                 // Computes the chunk
                 compute_chunk(chunk, buffer);
                 local_stats.compute_seconds += MPI_Wtime() - compute_start;
 
                 // Starts the timer for the IO
                 double io_start = MPI_Wtime();
+
                 // Writes the chunk to the rank file
                 write_chunk_to_rank_file(rank_output_file, chunk, buffer);
                 local_stats.io_seconds += MPI_Wtime() - io_start;
 
                 // Updates the local stats
                 local_stats.chunks_computed++;
+
                 local_stats.bytes_written += (unsigned long long)(5 * sizeof(int) + element_count * sizeof(uint8_t));
+
                 // Sends the chunk to the master
                 MPI_Send(chunk, 5, MPI_INT, 0, TAG_RESULT_META, MPI_COMM_WORLD);
                 free(buffer);
@@ -565,11 +543,14 @@ int main(int argc, char *argv[]) {
 
     // Waits for all processes to reach this point
     MPI_Barrier(MPI_COMM_WORLD);
+
     // Stops the timer for the run
     run_end = MPI_Wtime();
+
+    // Updates the local stats for the total time
     local_stats.total_seconds = run_end - run_start;
 
-    // Closes the rank output file
+    // Closes the rank output file if it is open
     if (rank_output_file != NULL) {
         fclose(rank_output_file);
     }
@@ -586,7 +567,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Gathers the local stats from the other processes
+    // Gathers the local stats from the other processes.
+    // Rank 0 may act only as a scheduler for multi-process runs, so its chunk count can be 0 by design.
     MPI_Gather(&local_stats, sizeof(BenchmarkStats), MPI_BYTE,
                all_stats, sizeof(BenchmarkStats), MPI_BYTE,
                0, MPI_COMM_WORLD);
