@@ -1,3 +1,7 @@
+//mpicc test.c -o julia_mpi -lm
+// mpirun -np 4 ./julia_mpi tiles 255 2 0.3 -0.4 10000 10000 1024
+// mpirun -np 6 ./julia_mpi tiles 100 2 0 0 1000 1000 1024
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -57,9 +61,6 @@ int compute_julia_value(double x, double y) {
             z = z * z + c;
         } else if (julia_power == 3) {
             z = z * z * z + c;
-        } else {
-            fprintf(stderr, "Unsupported julia_power=%d\n", julia_power);
-            MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
 
@@ -72,21 +73,14 @@ void parse_args(int argc, char *argv[], int rank) {
 
     if (argc >= 2) {
         if (snprintf(output_dir, sizeof(output_dir), "%s", argv[1]) >= (int)sizeof(output_dir)) {
-            if (rank == 0) {
-                fprintf(stderr, "Output directory path is too long\n");
-            }
+            
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
 
     if (argc >= 3) {
         max_iterations = atoi(argv[2]);
-        if (max_iterations <= 0 || max_iterations > 255) {
-            if (rank == 0) {
-                fprintf(stderr, "max_iterations must be between 1 and 255\n");
-            }
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+       
     }
 
     if (argc >= 4) {
@@ -194,14 +188,14 @@ void write_manifest_file(void) {
 }
 
 // Opens the output file for the given rank
-// The output file is a binary file that contains the Julia set
+// The output file is a binary file corresponding to the rank that contains the Julia set
 FILE *open_rank_output_file(int rank) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/rank_%d.bin", output_dir, rank);
 
     FILE *file = fopen(path, "wb");
     if (file == NULL) {
-        perror("Failed to open rank output file");
+        perror("Failed to open the rank output file");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
@@ -391,8 +385,10 @@ int main(int argc, char *argv[]) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     BenchmarkStats local_stats;
+
     // Initializes the local stats to 0
     memset(&local_stats, 0, sizeof(local_stats));
+
     // Initializes the run start and end times to 0
     double run_start = 0.0;
     double run_end = 0.0;
@@ -406,35 +402,45 @@ int main(int argc, char *argv[]) {
     // Opens the output file for the given rank
     rank_output_file = open_rank_output_file(rank);
 
-    // Waits for all processes to reach this point
+    // Waits for all processes to reach this point, at this point, all processes have parsed the arguments and opened the output file they write to
     MPI_Barrier(MPI_COMM_WORLD);
 
     // Starts the timer for the run
     run_start = MPI_Wtime();
 
     if (rank == 0) {
-        // Writes the manifest file
+
+        // Writes the manifest file, the manifest file contains the width, height, chunk size, maximum iterations, julia power, c_re, c_im, and output directory
         write_manifest_file();
 
         // Gets the total number of chunks
         int total_chunks = get_total_chunks();
+
+        // Initializes the next chunk to 0, this stores the next chunk that will be sent to the worker
         int next_chunk = 0;
+        // Initializes the completed chunks to 0
         int completed_chunks = 0;
 
-        // Rank 0 acts purely as the scheduler so workers stay fed with work.
-        // This avoids the master spending long periods computing while workers sit idle.
+        // Sends the work to the workers
         for (int worker = 1; worker < size; worker++) {
+            // If there are more chunks to send, sends the next chunk to the worker
             if (next_chunk < total_chunks) {
+
                 int *chunk = split_data_v3(next_chunk);
+
                 MPI_Send(chunk, 5, MPI_INT, worker, TAG_WORK, MPI_COMM_WORLD);
+
                 next_chunk++;
+
                 free(chunk);
+
             } else {
+                // Else their is no more work to send, sends the stop signal to the worker
                 MPI_Send(NULL, 0, MPI_INT, worker, TAG_STOP, MPI_COMM_WORLD);
             }
         }
 
-        // If there are no workers, rank 0 must compute everything locally.
+        // This is for running the program with only one process, if there are no workers, rank 0 must compute everything locally.
         if (size == 1) {
             while (next_chunk < total_chunks) {
                 int *chunk = split_data_v3(next_chunk);
@@ -464,18 +470,30 @@ int main(int argc, char *argv[]) {
                 free(chunk);
             }
         } else {
+            
+            // This is for running the program with multiple processes (This is still rank 0), rank 0 sends the work to the workers and the workers send the results back to rank 0
             while (completed_chunks < total_chunks) {
+
                 int finished_chunk[5];
+
                 MPI_Status recv_status;
 
+                // Receives the result from the worker
                 MPI_Recv(finished_chunk, 5, MPI_INT, MPI_ANY_SOURCE, TAG_RESULT_META, MPI_COMM_WORLD, &recv_status);
+
+                // Updates the completed chunk count
                 completed_chunks++;
 
+                // If there are more chunks to send, sends the next chunk to the worker
                 if (next_chunk < total_chunks) {
+
                     int *next = split_data_v3(next_chunk);
+
                     MPI_Send(next, 5, MPI_INT, recv_status.MPI_SOURCE, TAG_WORK, MPI_COMM_WORLD);
+
                     next_chunk++;
                     free(next);
+
                 } else {
                     MPI_Send(NULL, 0, MPI_INT, recv_status.MPI_SOURCE, TAG_STOP, MPI_COMM_WORLD);
                 }
