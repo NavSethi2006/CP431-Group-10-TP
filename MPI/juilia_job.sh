@@ -44,8 +44,8 @@ process_counts=(20 40 80)
 iteration_count=255
 julia_powers=(2)
 constants=("0.35491 0.355")
-width=50000
-height=50000
+width=100000
+height=100000
 chunk_size=1024
 
 echo "Benchmark plan:"
