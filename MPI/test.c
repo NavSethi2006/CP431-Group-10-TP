@@ -203,27 +203,17 @@ FILE *open_rank_output_file(int rank) {
     return file;
 }
 
-// Gets the width of the chunk
-// The width is the difference between the end and start x coordinates plus 1
-int get_chunk_width(const int *chunk) {
-    return chunk[2] - chunk[0] + 1;
-}
-
-// Gets the height of the chunk
-// The height is the difference between the end and start y coordinates plus 1
-int get_chunk_height(const int *chunk) {
-    return chunk[3] - chunk[1] + 1;
-}
 
 // Gets the number of elements in the chunk
 // The number of elements is the width multiplied by the height
 size_t get_chunk_element_count(const int *chunk) {
-    return (size_t)get_chunk_width(chunk) * (size_t)get_chunk_height(chunk);
+    int width = chunk[2] - chunk[0] + 1;
+    int height = chunk[3] - chunk[1] + 1;
+    return (size_t)width * (size_t)height;
 }
 
 // Writes the chunk to the rank file
 // The chunk is a 5 element array that contains the start x, start y, end x, end y, and chunk count
-// The buffer is a pointer to the buffer that contains the Julia set
 void write_chunk_to_rank_file(FILE *file, const int *chunk, const uint8_t *buffer) {
     size_t element_count = get_chunk_element_count(chunk);
 
@@ -241,7 +231,6 @@ void write_chunk_to_rank_file(FILE *file, const int *chunk, const uint8_t *buffe
 }
 
 // Splits the data into chunks
-// The data is split into chunks in row-major order
 int *split_data_v3(int chunk_count) {
     int chunks_x = (width + chunk_size - 1) / chunk_size;
     int chunks_y = (height + chunk_size - 1) / chunk_size;
@@ -308,12 +297,8 @@ void compute_chunk(const int *chunk, uint8_t *buffer) {
 }
 
 // Writes the benchmark file
-// The benchmark file contains the width, height, chunk size, maximum iterations, number of MPI processes, total chunks, recorded chunks, wall seconds, total compute seconds, total IO seconds, total bytes written, max rank total seconds, and min rank total seconds
-// The all_stats is a pointer to the array of BenchmarkStats
-// The size is the number of MPI processes
-// The total_chunks is the total number of chunks
-// The wall_seconds is the wall time of the run
 void write_benchmark_file(const BenchmarkStats *all_stats, int size, int total_chunks, double wall_seconds) {
+
     char benchmark_path[PATH_MAX];
     snprintf(benchmark_path, sizeof(benchmark_path), "%s/benchmark.txt", output_dir);
 
@@ -329,6 +314,7 @@ void write_benchmark_file(const BenchmarkStats *all_stats, int size, int total_c
     long long total_chunks_recorded = 0LL;
     double max_rank_total = 0.0;
     double min_rank_total = 0.0;
+
 
     for (int i = 0; i < size; i++) {
         total_compute += all_stats[i].compute_seconds;
