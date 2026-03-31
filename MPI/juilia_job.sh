@@ -84,7 +84,7 @@ do
                     echo "Run completed for $outdir"
                     if [ -f "$outdir/benchmark.txt" ]; then
                         echo "Benchmark summary for $outdir:"
-                        grep -E 'MPI_PROCESSES|WIDTH|HEIGHT|CHUNK_SIZE|MAX_ITERATIONS|JULIA_POWER|C_RE|C_IM|WALL_SECONDS|TOTAL_COMPUTE_SECONDS|TOTAL_IO_SECONDS|ESTIMATED_IDLE_SECONDS|TOTAL_CHUNKS|TOTAL_BYTES_WRITTEN' "$outdir/benchmark.txt"
+                        grep -E 'MPI_PROCESSES|WIDTH|HEIGHT|CHUNK_SIZE|MAX_ITERATIONS|JULIA_POWER|C_RE|C_IM|WALL_SECONDS|TOTAL_COMPUTE_SECONDS|TOTAL_IO_SECONDS|TOTAL_SETUP_SECONDS|ESTIMATED_IDLE_SECONDS|TOTAL_CHUNKS|TOTAL_BYTES_WRITTEN' "$outdir/benchmark.txt"
                     fi
                 fi
 

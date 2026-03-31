@@ -36,6 +36,7 @@ typedef struct {
     long long chunks_computed;
     double compute_seconds;
     double io_seconds;
+    double setup_seconds;
     double total_seconds;
     unsigned long long bytes_written;
 } BenchmarkStats;
@@ -324,6 +325,7 @@ void write_benchmark_file(const BenchmarkStats *all_stats, int size, int total_c
 
     double total_compute = 0.0;
     double total_io = 0.0;
+    double total_setup = 0.0;
     long long total_chunks_recorded = 0LL;
     double max_rank_total = 0.0;
     double min_rank_total = 0.0;
@@ -331,6 +333,7 @@ void write_benchmark_file(const BenchmarkStats *all_stats, int size, int total_c
     for (int i = 0; i < size; i++) {
         total_compute += all_stats[i].compute_seconds;
         total_io += all_stats[i].io_seconds;
+        total_setup += all_stats[i].setup_seconds;
         total_chunks_recorded += all_stats[i].chunks_computed;
 
         if (i == 0 || all_stats[i].total_seconds > max_rank_total) {
@@ -356,20 +359,22 @@ void write_benchmark_file(const BenchmarkStats *all_stats, int size, int total_c
     fprintf(file, "WALL_SECONDS %.6f\n", wall_seconds);
     fprintf(file, "TOTAL_COMPUTE_SECONDS %.6f\n", total_compute);
     fprintf(file, "TOTAL_IO_SECONDS %.6f\n", total_io);
+    fprintf(file, "TOTAL_SETUP_SECONDS %.6f\n", total_setup);
     fprintf(file, "MAX_RANK_TOTAL_SECONDS %.6f\n", max_rank_total);
     fprintf(file, "MIN_RANK_TOTAL_SECONDS %.6f\n", min_rank_total);
-    fprintf(file, "ESTIMATED_IDLE_SECONDS %.6f\n", max_rank_total * size - total_compute - total_io);
+    fprintf(file, "ESTIMATED_IDLE_SECONDS %.6f\n", max_rank_total * size - total_compute - total_io - total_setup);
     fprintf(file, "\nPer-rank statistics\n");
-    fprintf(file, "rank chunks compute_seconds io_seconds total_seconds bytes_written\n");
+    fprintf(file, "rank chunks compute_seconds io_seconds setup_seconds total_seconds bytes_written\n");
 
     for (int i = 0; i < size; i++) {
         fprintf(
             file,
-            "%d %lld %.6f %.6f %.6f %llu\n",
+            "%d %lld %.6f %.6f %.6f %.6f %llu\n",
             i,
             all_stats[i].chunks_computed,
             all_stats[i].compute_seconds,
             all_stats[i].io_seconds,
+            all_stats[i].setup_seconds,
             all_stats[i].total_seconds,
             all_stats[i].bytes_written
         );
@@ -394,6 +399,7 @@ int main(int argc, char *argv[]) {
     double run_end = 0.0;
 
     FILE *rank_output_file = NULL;
+    double setup_start = MPI_Wtime();
     parse_args(argc, argv, rank);
 
     // Ensures the output directory exists and is writable
@@ -404,6 +410,7 @@ int main(int argc, char *argv[]) {
 
     // Waits for all processes to reach this point, at this point, all processes have parsed the arguments and opened the output file they write to
     MPI_Barrier(MPI_COMM_WORLD);
+    local_stats.setup_seconds = MPI_Wtime() - setup_start;
 
     // Starts the timer for the run
     run_start = MPI_Wtime();
@@ -585,6 +592,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    printf("[rank %d] setup_seconds=%.6f io_seconds=%.6f compute_seconds=%.6f total_seconds=%.6f\n",
+           rank,
+           local_stats.setup_seconds,
+           local_stats.io_seconds,
+           local_stats.compute_seconds,
+           local_stats.total_seconds);
     // Gathers the local stats from the other processes.
     // Rank 0 may act only as a scheduler for multi-process runs, so its chunk count can be 0 by design.
     MPI_Gather(&local_stats, sizeof(BenchmarkStats), MPI_BYTE,
