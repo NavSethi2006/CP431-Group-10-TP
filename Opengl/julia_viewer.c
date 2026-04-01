@@ -1,27 +1,42 @@
+
+
 #define GL_SILENCE_DEPRECATION
-// #include "glut.h"
-// mac
 #include <GLUT/glut.h>
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <math.h>
 #include <stdint.h>
-#include <errno.h>
-#include <sys/stat.h>
+#include <string.h>
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
+#include <math.h>
+#include <jpeglib.h>
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
+#define DEFAULT_TILES_DIR "../MPI/tiles"
+#define DEFAULT_OUTPUT_JPEG "julia_opengl.jpg"
+#define DEFAULT_JPEG_QUALITY 95
+#define DEFAULT_RENDER_STRIP_HEIGHT 1024
 
-#define MAX_OPEN_TILES 64
-#define SAFE_MAX_TILE_DIM 4096
-#define MAX_TILE_LOADS_PER_FRAME 8
+typedef struct {
+    int width;
+    int height;
+    int chunk_size;
+    int max_iterations;
+    double threshold;
+    double c_re;
+    double c_im;
+    char function_name[64];
+} Manifest;
 
-static GLint gpu_max_texture_size = 0;
+typedef struct {
+    char path[PATH_MAX];
+    FILE *fp;
+} RankFile;
 
 typedef struct {
     char path[PATH_MAX];
@@ -33,807 +48,574 @@ typedef struct {
     int chunk_id;
     int tile_width;
     int tile_height;
-    GLuint texture_id;
-    int texture_loaded;
-    unsigned long last_used_frame;
-    int subtiles_per_side;
-} TileRecord;
+    int rank_index;
+} ChunkRecord;
 
-static TileRecord *tiles = NULL;
-static int tile_count = 0;
-static int tile_capacity = 0;
-static int width = 0;
-static int height = 0;
-static char *filename = NULL;
-static float zoom_factor = 1.0f;
-static const float max_zoom_factor = 50.0f;
-static float pan_x = 0.0f;
-static float pan_y = 0.0f;
-static int window_width = 1000;
-static int window_height = 1000;
-static unsigned long frame_counter = 0;
-static int loaded_tile_count = 0;
-static int needs_more_frames = 0;
-static int initial_view_fitted = 0;
+typedef struct {
+    double t;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} ColorStop;
 
-void get_color(unsigned char index, unsigned char *r, unsigned char *g, unsigned char *b);
-int read_tiles_from_manifest(const char *input_path);
-int load_input_data(const char *input_path);
-int read_data_file(const char *fname);
-void save_jpeg(const char *outfile);
-void display(void);
-void reshape(int w, int h);
-void keyboard(unsigned char key, int x, int y);
-void idle(void);
+static GLuint g_fbo = 0;
+static GLuint g_color_tex = 0;
+static GLuint g_input_tex = 0;
+static int g_window = 0;
+static int g_strip_width = 0;
+static int g_strip_height = 0;
 
-static int path_is_directory(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        return 0;
-    }
-    return S_ISDIR(st.st_mode);
+static void fail(const char *message) {
+    perror(message);
+    exit(EXIT_FAILURE);
 }
 
-static void free_tiles(void) {
-    if (tiles == NULL) {
+static void fail_message(const char *message) {
+    fprintf(stderr, "%s\n", message);
+    exit(EXIT_FAILURE);
+}
+
+static int starts_with(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static int ends_with(const char *s, const char *suffix) {
+    size_t ls = strlen(s);
+    size_t lf = strlen(suffix);
+    if (lf > ls) {
+        return 0;
+    }
+    return strcmp(s + ls - lf, suffix) == 0;
+}
+
+static int compare_rank_file_names(const void *a, const void *b) {
+    const char *const *sa = (const char *const *)a;
+    const char *const *sb = (const char *const *)b;
+    return strcmp(*sa, *sb);
+}
+
+static uint8_t interpolate_channel(uint8_t a, uint8_t b, double t) {
+    return (uint8_t)lrint((1.0 - t) * (double)a + t * (double)b);
+}
+
+static void iteration_to_rgb(uint8_t value, int max_iterations, uint8_t *r, uint8_t *g, uint8_t *b) {
+    static const ColorStop palette[] = {
+        {0.00,   0,   0,   0},
+        {0.02,  25,   7,  26},
+        {0.05,  15,  30, 120},
+        {0.10,  30,  80, 200},
+        {0.18,  20, 160, 230},
+        {0.28,  30, 220, 180},
+        {0.40, 120, 235,  80},
+        {0.52, 245, 240,  60},
+        {0.64, 255, 180,  35},
+        {0.76, 255, 100,  60},
+        {0.88, 255,  70, 170},
+        {1.00, 210, 120, 255}
+    };
+    const int palette_count = (int)(sizeof(palette) / sizeof(palette[0]));
+
+    int effective_max = max_iterations;
+    if (effective_max > 255) {
+        effective_max = 255;
+    }
+    if (effective_max < 1) {
+        effective_max = 1;
+    }
+
+    if (value >= (uint8_t)effective_max) {
+        *r = 0;
+        *g = 0;
+        *b = 0;
         return;
     }
 
-    for (int i = 0; i < tile_count; i++) {
-        if (tiles[i].texture_loaded && tiles[i].texture_id != 0) {
-            glDeleteTextures(1, &tiles[i].texture_id);
+    double t = sqrt((double)value / (double)effective_max);
+
+    for (int i = 0; i < palette_count - 1; i++) {
+        const ColorStop *left = &palette[i];
+        const ColorStop *right = &palette[i + 1];
+        if (t <= right->t) {
+            double local_t = (t - left->t) / (right->t - left->t);
+            if (local_t < 0.0) {
+                local_t = 0.0;
+            }
+            if (local_t > 1.0) {
+                local_t = 1.0;
+            }
+            *r = interpolate_channel(left->r, right->r, local_t);
+            *g = interpolate_channel(left->g, right->g, local_t);
+            *b = interpolate_channel(left->b, right->b, local_t);
+            return;
         }
     }
 
-    free(tiles);
-    tiles = NULL;
-    tile_count = 0;
-    tile_capacity = 0;
-    loaded_tile_count = 0;
+    *r = palette[palette_count - 1].r;
+    *g = palette[palette_count - 1].g;
+    *b = palette[palette_count - 1].b;
 }
 
-static int ensure_tile_capacity(void) {
-    if (tile_count < tile_capacity) {
-        return 0;
+static void parse_manifest(const char *manifest_path, Manifest *manifest) {
+    FILE *fp = fopen(manifest_path, "r");
+    if (fp == NULL) {
+        fail("Failed to open manifest.txt");
     }
 
-    int new_capacity = (tile_capacity == 0) ? 128 : tile_capacity * 2;
-    TileRecord *new_tiles = realloc(tiles, (size_t)new_capacity * sizeof(TileRecord));
-    if (!new_tiles) {
-        fprintf(stderr, "Failed to grow tile index\n");
-        return 1;
-    }
+    memset(manifest, 0, sizeof(*manifest));
+    manifest->threshold = 2.0;
+    strcpy(manifest->function_name, "unknown");
 
-    tiles = new_tiles;
-    tile_capacity = new_capacity;
-    return 0;
-}
-
-static void clamp_pan(void) {
-    float visible_w = 1.0f / zoom_factor;
-    float visible_h = 1.0f / zoom_factor;
-    float max_pan_x = (1.0f - visible_w) * 0.5f;
-    float max_pan_y = (1.0f - visible_h) * 0.5f;
-
-    if (pan_x > max_pan_x) pan_x = max_pan_x;
-    if (pan_x < -max_pan_x) pan_x = -max_pan_x;
-    if (pan_y > max_pan_y) pan_y = max_pan_y;
-    if (pan_y < -max_pan_y) pan_y = -max_pan_y;
-}
-
-static void get_view_bounds_pixels(double *left_px, double *right_px, double *top_px, double *bottom_px) {
-    float visible_w = 1.0f / zoom_factor;
-    float visible_h = 1.0f / zoom_factor;
-    float u0 = 0.5f - visible_w * 0.5f + pan_x;
-    float v0 = 0.5f - visible_h * 0.5f + pan_y;
-    float u1 = u0 + visible_w;
-    float v1 = v0 + visible_h;
-
-    if (u0 < 0.0f) { u1 -= u0; u0 = 0.0f; }
-    if (v0 < 0.0f) { v1 -= v0; v0 = 0.0f; }
-    if (u1 > 1.0f) { u0 -= (u1 - 1.0f); u1 = 1.0f; }
-    if (v1 > 1.0f) { v0 -= (v1 - 1.0f); v1 = 1.0f; }
-
-    *left_px = (double)u0 * (double)width;
-    *right_px = (double)u1 * (double)width;
-    *top_px = (double)v0 * (double)height;
-    *bottom_px = (double)v1 * (double)height;
-}
-
-static int tile_intersects_view(const TileRecord *tile, double left_px, double right_px, double top_px, double bottom_px) {
-    double tile_left = (double)tile->start_x;
-    double tile_right = (double)(tile->end_x + 1);
-    double tile_top = (double)tile->start_y;
-    double tile_bottom = (double)(tile->end_y + 1);
-
-    if (tile_right <= left_px) return 0;
-    if (tile_left >= right_px) return 0;
-    if (tile_bottom <= top_px) return 0;
-    if (tile_top >= bottom_px) return 0;
-    return 1;
-}
-
-static void evict_one_tile_if_needed(void) {
-    if (loaded_tile_count < MAX_OPEN_TILES) {
-        return;
-    }
-
-    int victim = -1;
-    unsigned long oldest_frame = 0;
-
-    for (int i = 0; i < tile_count; i++) {
-        if (!tiles[i].texture_loaded) {
-            continue;
-        }
-        if (victim == -1 || tiles[i].last_used_frame < oldest_frame) {
-            victim = i;
-            oldest_frame = tiles[i].last_used_frame;
-        }
-    }
-
-    if (victim >= 0) {
-        glDeleteTextures(1, &tiles[victim].texture_id);
-        tiles[victim].texture_id = 0;
-        tiles[victim].texture_loaded = 0;
-        loaded_tile_count--;
-    }
-}
-
-static int load_tile_texture(TileRecord *tile) {
-    if (tile->texture_loaded) {
-        tile->last_used_frame = frame_counter;
-        return 0;
-    }
-
-    evict_one_tile_if_needed();
-
-    FILE *f = fopen(tile->path, "rb");
-    if (!f) {
-        perror("Cannot open rank file for tile load");
-        return 1;
-    }
-
-    if (fseek(f, tile->payload_offset, SEEK_SET) != 0) {
-        perror("Failed to seek to tile payload");
-        fclose(f);
-        return 1;
-    }
-
-    size_t gray_size = (size_t)tile->tile_width * (size_t)tile->tile_height;
-    uint8_t *gray = malloc(gray_size);
-    if (!gray) {
-        fprintf(stderr, "Failed to allocate tile grayscale buffer\n");
-        fclose(f);
-        return 1;
-    }
-
-    if (fread(gray, sizeof(uint8_t), gray_size, f) != gray_size) {
-        fprintf(stderr, "Failed to read tile payload from %s\n", tile->path);
-        free(gray);
-        fclose(f);
-        return 1;
-    }
-
-    fclose(f);
-
-    int effective_limit = SAFE_MAX_TILE_DIM;
-    if (gpu_max_texture_size > 0 && gpu_max_texture_size < effective_limit) {
-        effective_limit = gpu_max_texture_size;
-    }
-    if (effective_limit < 1) {
-        effective_limit = 1;
-    }
-
-    int max_dim = tile->tile_width > tile->tile_height ? tile->tile_width : tile->tile_height;
-    tile->subtiles_per_side = (max_dim + effective_limit - 1) / effective_limit;
-    if (tile->subtiles_per_side < 1) {
-        tile->subtiles_per_side = 1;
-    }
-
-    int upload_width = tile->tile_width;
-    int upload_height = tile->tile_height;
-    if (upload_width > effective_limit) upload_width = effective_limit;
-    if (upload_height > effective_limit) upload_height = effective_limit;
-
-    unsigned char *rgb = malloc((size_t)upload_width * (size_t)upload_height * 3);
-    if (!rgb) {
-        fprintf(stderr, "Failed to allocate tile RGB buffer\n");
-        free(gray);
-        return 1;
-    }
-
-    for (int row = 0; row < upload_height; row++) {
-        for (int col = 0; col < upload_width; col++) {
-            int src_index = row * tile->tile_width + col;
-            int dst_row = upload_height - 1 - row;
-            int dst_index = dst_row * upload_width + col;
-            unsigned char r, g, b;
-            get_color(gray[src_index], &r, &g, &b);
-            rgb[dst_index * 3 + 0] = r;
-            rgb[dst_index * 3 + 1] = g;
-            rgb[dst_index * 3 + 2] = b;
-        }
-    }
-
-    free(gray);
-
-    glGenTextures(1, &tile->texture_id);
-    glBindTexture(GL_TEXTURE_2D, tile->texture_id);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(
-        GL_TEXTURE_2D,
-        0,
-        GL_RGB,
-        upload_width,
-        upload_height,
-        0,
-        GL_RGB,
-        GL_UNSIGNED_BYTE,
-        rgb
-    );
-
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        fprintf(stderr, "glTexImage2D failed for tile %d (%dx%d) with OpenGL error %u\n", tile->chunk_id, upload_width, upload_height, (unsigned int)err);
-        glDeleteTextures(1, &tile->texture_id);
-        tile->texture_id = 0;
-        free(rgb);
-        return 1;
-    }
-
-    free(rgb);
-
-    tile->texture_loaded = 1;
-    tile->last_used_frame = frame_counter;
-    loaded_tile_count++;
-    return 0;
-}
-
-// Color map - map escape index (0..255) to RGB
-void get_color(unsigned char index, unsigned char *r, unsigned char *g, unsigned char *b) {
-    if(index == 0) {
-        *r = 0; *g = 0; *b = 0;
-        return;
-    }
-
-    float t = (float) index / 255.0f;
-    *r = (unsigned char)(sin(t * 2.0 * M_PI) * 127 + 128);
-    *g = (unsigned char)(sin((t + 1.0f / 3.0f) * 2.0 * M_PI) * 127 + 128);
-    *b = (unsigned char)(sin((t + 2.0f / 3.0f) * 2.0 * M_PI) * 127 + 128);
-}
-
-int read_tiles_from_manifest(const char *input_path) {
-    char manifest_path[PATH_MAX];
-    if (path_is_directory(input_path)) {
-        snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.txt", input_path);
-    } else {
-        snprintf(manifest_path, sizeof(manifest_path), "%s", input_path);
-    }
-
-    FILE *manifest = fopen(manifest_path, "r");
-    if (!manifest) {
-        perror("Cannot open manifest file");
-        return 1;
-    }
-
-    int manifest_width = 0;
-    int manifest_height = 0;
-    int manifest_chunk_size = 0;
-    int manifest_max_iterations = 0;
     char key[128];
-    int value = 0;
-
-    while (fscanf(manifest, "%127s %d", key, &value) == 2) {
+    while (fscanf(fp, "%127s", key) == 1) {
         if (strcmp(key, "WIDTH") == 0) {
-            manifest_width = value;
+            fscanf(fp, "%d", &manifest->width);
         } else if (strcmp(key, "HEIGHT") == 0) {
-            manifest_height = value;
+            fscanf(fp, "%d", &manifest->height);
         } else if (strcmp(key, "CHUNK_SIZE") == 0) {
-            manifest_chunk_size = value;
+            fscanf(fp, "%d", &manifest->chunk_size);
         } else if (strcmp(key, "MAX_ITERATIONS") == 0) {
-            manifest_max_iterations = value;
-        }
-    }
-    fclose(manifest);
-
-    if (manifest_width <= 0 || manifest_height <= 0 || manifest_chunk_size <= 0 || manifest_max_iterations <= 0) {
-        fprintf(stderr, "Invalid manifest contents in %s\n", manifest_path);
-        return 1;
-    }
-
-    width = manifest_width;
-    height = manifest_height;
-    if (!initial_view_fitted) {
-        double tiles_x = (double)width / (double)SAFE_MAX_TILE_DIM;
-        double tiles_y = (double)height / (double)SAFE_MAX_TILE_DIM;
-        double needed_zoom = tiles_x > tiles_y ? tiles_x : tiles_y;
-        if (needed_zoom < 1.0) {
-            needed_zoom = 1.0;
-        }
-        if (needed_zoom > max_zoom_factor) {
-            needed_zoom = max_zoom_factor;
-        }
-        zoom_factor = (float)needed_zoom;
-        pan_x = 0.0f;
-        pan_y = 0.0f;
-        initial_view_fitted = 1;
-    }
-
-    char tiles_dir[PATH_MAX];
-    if (path_is_directory(input_path)) {
-        snprintf(tiles_dir, sizeof(tiles_dir), "%s", input_path);
-    } else {
-        strncpy(tiles_dir, manifest_path, sizeof(tiles_dir) - 1);
-        tiles_dir[sizeof(tiles_dir) - 1] = '\0';
-        char *last_slash = strrchr(tiles_dir, '/');
-        if (last_slash) {
-            *last_slash = '\0';
+            fscanf(fp, "%d", &manifest->max_iterations);
+        } else if (strcmp(key, "THRESHOLD") == 0) {
+            fscanf(fp, "%lf", &manifest->threshold);
+        } else if (strcmp(key, "FUNCTION") == 0) {
+            fscanf(fp, "%63s", manifest->function_name);
+        } else if (strcmp(key, "C_RE") == 0) {
+            fscanf(fp, "%lf", &manifest->c_re);
+        } else if (strcmp(key, "C_IM") == 0) {
+            fscanf(fp, "%lf", &manifest->c_im);
         } else {
-            snprintf(tiles_dir, sizeof(tiles_dir), ".");
+            char discard[256];
+            fgets(discard, sizeof(discard), fp);
         }
     }
 
+    fclose(fp);
+
+    if (manifest->width <= 0 || manifest->height <= 0 || manifest->chunk_size <= 0 || manifest->max_iterations <= 0) {
+        fail_message("Manifest is missing required values or contains invalid dimensions.");
+    }
+}
+
+static void collect_rank_file_names(const char *tiles_dir, char ***names_out, int *count_out) {
     DIR *dir = opendir(tiles_dir);
-    if (!dir) {
-        perror("Cannot open tiles directory");
-        return 1;
+    if (dir == NULL) {
+        fail("Failed to open tiles directory");
     }
 
-    int rank_file_count = 0;
+    int capacity = 16;
+    int count = 0;
+    char **names = (char **)malloc((size_t)capacity * sizeof(char *));
+    if (names == NULL) {
+        closedir(dir);
+        fail("Failed to allocate rank file name list");
+    }
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, "rank_", 5) != 0) {
-            continue;
+        if (starts_with(entry->d_name, "rank_") && ends_with(entry->d_name, ".bin")) {
+            if (count == capacity) {
+                capacity *= 2;
+                char **grown = (char **)realloc(names, (size_t)capacity * sizeof(char *));
+                if (grown == NULL) {
+                    closedir(dir);
+                    fail("Failed to grow rank file name list");
+                }
+                names = grown;
+            }
+
+            names[count] = strdup(entry->d_name);
+            if (names[count] == NULL) {
+                closedir(dir);
+                fail("Failed to duplicate rank file name");
+            }
+            count++;
         }
-        if (strstr(entry->d_name, ".bin") == NULL) {
-            continue;
-        }
-
-        char rank_path[PATH_MAX];
-        snprintf(rank_path, sizeof(rank_path), "%s/%s", tiles_dir, entry->d_name);
-
-        FILE *rank_file = fopen(rank_path, "rb");
-        if (!rank_file) {
-            perror("Cannot open rank file");
-            closedir(dir);
-            free_tiles();
-            return 1;
-        }
-
-        rank_file_count++;
-
-        while (1) {
-            int chunk[5];
-            long header_offset = ftell(rank_file);
-            if (header_offset < 0) {
-                perror("ftell failed on rank file");
-                fclose(rank_file);
-                closedir(dir);
-                free_tiles();
-                return 1;
-            }
-
-            size_t header_items = fread(chunk, sizeof(int), 5, rank_file);
-            if (header_items == 0) {
-                break;
-            }
-            if (header_items != 5) {
-                fprintf(stderr, "Failed to read chunk header from %s\n", rank_path);
-                fclose(rank_file);
-                closedir(dir);
-                free_tiles();
-                return 1;
-            }
-
-            int start_x = chunk[0];
-            int start_y = chunk[1];
-            int end_x = chunk[2];
-            int end_y = chunk[3];
-            int chunk_id = chunk[4];
-            int tile_width = end_x - start_x + 1;
-            int tile_height = end_y - start_y + 1;
-
-            if (start_x < 0 || start_y < 0 || end_x >= width || end_y >= height || tile_width <= 0 || tile_height <= 0) {
-                fprintf(stderr, "Invalid chunk bounds in %s\n", rank_path);
-                fclose(rank_file);
-                closedir(dir);
-                free_tiles();
-                return 1;
-            }
-
-            if (ensure_tile_capacity() != 0) {
-                fclose(rank_file);
-                closedir(dir);
-                free_tiles();
-                return 1;
-            }
-
-            long payload_offset = header_offset + (long)(5 * sizeof(int));
-            TileRecord *tile = &tiles[tile_count++];
-            memset(tile, 0, sizeof(*tile));
-            snprintf(tile->path, sizeof(tile->path), "%s", rank_path);
-            tile->payload_offset = payload_offset;
-            tile->start_x = start_x;
-            tile->start_y = start_y;
-            tile->end_x = end_x;
-            tile->end_y = end_y;
-            tile->chunk_id = chunk_id;
-            tile->tile_width = tile_width;
-            tile->tile_height = tile_height;
-            tile->texture_id = 0;
-            tile->texture_loaded = 0;
-            tile->last_used_frame = 0;
-            tile->subtiles_per_side = 1;
-
-            size_t tile_size = (size_t)tile_width * (size_t)tile_height;
-            if (fseek(rank_file, (long)tile_size, SEEK_CUR) != 0) {
-                fprintf(stderr, "Failed to skip chunk payload in %s\n", rank_path);
-                fclose(rank_file);
-                closedir(dir);
-                free_tiles();
-                return 1;
-            }
-        }
-
-        fclose(rank_file);
     }
 
     closedir(dir);
 
-    if (rank_file_count == 0) {
-        fprintf(stderr, "No rank_*.bin files found in %s\n", tiles_dir);
-        free_tiles();
-        return 1;
+    if (count == 0) {
+        free(names);
+        fail_message("No rank_*.bin files were found in the tiles directory.");
     }
 
-    if (tile_count == 0) {
-        fprintf(stderr, "No chunk records found in rank files under %s\n", tiles_dir);
-        free_tiles();
-        return 1;
-    }
-
-    return 0;
+    qsort(names, (size_t)count, sizeof(char *), compare_rank_file_names);
+    *names_out = names;
+    *count_out = count;
 }
 
-int load_input_data(const char *input_path) {
-    if (path_is_directory(input_path)) {
-        return read_tiles_from_manifest(input_path);
+static void open_rank_files(const char *tiles_dir, RankFile **rank_files_out, int *rank_file_count_out) {
+    char **names = NULL;
+    int count = 0;
+    collect_rank_file_names(tiles_dir, &names, &count);
+
+    RankFile *rank_files = (RankFile *)calloc((size_t)count, sizeof(RankFile));
+    if (rank_files == NULL) {
+        fail("Failed to allocate rank file table");
     }
 
-    if (strstr(input_path, "manifest.txt") != NULL) {
-        return read_tiles_from_manifest(input_path);
-    }
-
-    return read_data_file(input_path);
-}
-
-// Legacy single-file loader retained for compatibility.
-int read_data_file(const char *fname) {
-    FILE *f = fopen(fname, "rb");
-    if (!f) {
-        perror("Cannot open file");
-        return 1;
-    }
-
-    int file_width = 0;
-    int file_height = 0;
-
-    if (fread(&file_width, sizeof(int), 1, f) != 1 ||
-        fread(&file_height, sizeof(int), 1, f) != 1) {
-        fprintf(stderr, "Failed to read width/height header from %s\n", fname);
-        fclose(f);
-        return 1;
-    }
-
-    if (file_width <= 0 || file_height <= 0) {
-        fprintf(stderr, "Invalid image dimensions in %s: %d x %d\n", fname, file_width, file_height);
-        fclose(f);
-        return 1;
-    }
-
-    width = file_width;
-    height = file_height;
-    if (!initial_view_fitted) {
-        double tiles_x = (double)width / (double)SAFE_MAX_TILE_DIM;
-        double tiles_y = (double)height / (double)SAFE_MAX_TILE_DIM;
-        double needed_zoom = tiles_x > tiles_y ? tiles_x : tiles_y;
-        if (needed_zoom < 1.0) {
-            needed_zoom = 1.0;
+    for (int i = 0; i < count; i++) {
+        snprintf(rank_files[i].path, sizeof(rank_files[i].path), "%s/%s", tiles_dir, names[i]);
+        rank_files[i].fp = fopen(rank_files[i].path, "rb");
+        if (rank_files[i].fp == NULL) {
+            fail("Failed to open rank bin file");
         }
-        if (needed_zoom > max_zoom_factor) {
-            needed_zoom = max_zoom_factor;
-        }
-        zoom_factor = (float)needed_zoom;
-        pan_x = 0.0f;
-        pan_y = 0.0f;
-        initial_view_fitted = 1;
+        free(names[i]);
     }
+    free(names);
 
-    if (ensure_tile_capacity() != 0) {
-        fclose(f);
-        return 1;
-    }
-
-    TileRecord *tile = &tiles[tile_count++];
-    memset(tile, 0, sizeof(*tile));
-    snprintf(tile->path, sizeof(tile->path), "%s", fname);
-    tile->payload_offset = (long)(2 * sizeof(int));
-    tile->start_x = 0;
-    tile->start_y = 0;
-    tile->end_x = width - 1;
-    tile->end_y = height - 1;
-    tile->chunk_id = 0;
-    tile->tile_width = width;
-    tile->tile_height = height;
-    tile->texture_id = 0;
-    tile->texture_loaded = 0;
-    tile->last_used_frame = 0;
-    tile->subtiles_per_side = 1;
-
-    fclose(f);
-    return 0;
+    *rank_files_out = rank_files;
+    *rank_file_count_out = count;
 }
 
-// Saves the current opengl window as a jpeg
-void save_jpeg(const char *outfile) {
-    unsigned char *pixels = malloc((size_t)window_width * (size_t)window_height * 3);
-    if(!pixels) {
-        fprintf(stderr, "Out of memory to take a screenshot\n");
-        return;
-    }
-    glReadPixels(0, 0, window_width, window_height, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+static void scan_chunks(
+    RankFile *rank_files,
+    int rank_file_count,
+    ChunkRecord **chunks_out,
+    int *chunk_count_out,
+    int chunks_x,
+    int chunks_y
+) {
+    const int expected_chunks = chunks_x * chunks_y;
+    ChunkRecord *chunks = (ChunkRecord *)malloc((size_t)expected_chunks * sizeof(ChunkRecord));
+   
+    int chunk_count = 0;
+    for (int file_index = 0; file_index < rank_file_count; file_index++) {
+        FILE *fp = rank_files[file_index].fp;
+        while (1) {
+            int header[5];
+            size_t read_count = fread(header, sizeof(int), 5, fp);
+           
+            ChunkRecord record;
+            memset(&record, 0, sizeof(record));
+            snprintf(record.path, sizeof(record.path), "%s", rank_files[file_index].path);
+            record.start_x = header[0];
+            record.start_y = header[1];
+            record.end_x = header[2];
+            record.end_y = header[3];
+            record.chunk_id = header[4];
+            record.tile_width = record.end_x - record.start_x + 1;
+            record.tile_height = record.end_y - record.start_y + 1;
+            record.rank_index = file_index;
+            record.payload_offset = ftell(fp);
 
-    unsigned char *flipped = malloc((size_t)window_width * (size_t)window_height * 3);
-    if(!flipped) {
-        fprintf(stderr, "Out of memory to flip screenshot\n");
-        free(pixels);
-        return;
-    }
-    for(int i = 0; i < window_height; i++) {
-        memcpy(
-            flipped + (size_t)i * (size_t)window_width * 3,
-            pixels + (size_t)(window_height - 1 - i) * (size_t)window_width * 3,
-            (size_t)window_width * 3
-        );
-    }
+            
 
-    if(stbi_write_jpg(outfile, window_width, window_height, 3, flipped, 90) == 0) {
-        fprintf(stderr, "Failed to write jpeg file %s\n", outfile);
-    } else {
-        printf("Saved %s\n", outfile);
-    }
+            chunks[chunk_count++] = record;
 
-    free(pixels);
-    free(flipped);
-}
-
-static void draw_tile(const TileRecord *tile, double left_px, double right_px, double top_px, double bottom_px) {
-    double tile_left = (double)tile->start_x;
-    double tile_top = (double)tile->start_y;
-    double view_w = right_px - left_px;
-    double view_h = bottom_px - top_px;
-
-    int parts = tile->subtiles_per_side;
-    if (parts < 1) {
-        parts = 1;
-    }
-
-    for (int part_y = 0; part_y < parts; part_y++) {
-        for (int part_x = 0; part_x < parts; part_x++) {
-            double local_x0 = ((double)part_x / (double)parts) * (double)tile->tile_width;
-            double local_x1 = ((double)(part_x + 1) / (double)parts) * (double)tile->tile_width;
-            double local_y0 = ((double)part_y / (double)parts) * (double)tile->tile_height;
-            double local_y1 = ((double)(part_y + 1) / (double)parts) * (double)tile->tile_height;
-
-            double world_x0 = tile_left + local_x0;
-            double world_x1 = tile_left + local_x1;
-            double world_y0 = tile_top + local_y0;
-            double world_y1 = tile_top + local_y1;
-
-            double x0 = ((world_x0 - left_px) / view_w) * 2.0 - 1.0;
-            double x1 = ((world_x1 - left_px) / view_w) * 2.0 - 1.0;
-            double y0 = 1.0 - ((world_y0 - top_px) / view_h) * 2.0;
-            double y1 = 1.0 - ((world_y1 - top_px) / view_h) * 2.0;
-
-            double u0 = (double)part_x / (double)parts;
-            double u1 = (double)(part_x + 1) / (double)parts;
-            double v0 = (double)part_y / (double)parts;
-            double v1 = (double)(part_y + 1) / (double)parts;
-
-            glBindTexture(GL_TEXTURE_2D, tile->texture_id);
-            glBegin(GL_QUADS);
-            glTexCoord2f((GLfloat)u0, (GLfloat)v0); glVertex2f((GLfloat)x0, (GLfloat)y1);
-            glTexCoord2f((GLfloat)u1, (GLfloat)v0); glVertex2f((GLfloat)x1, (GLfloat)y1);
-            glTexCoord2f((GLfloat)u1, (GLfloat)v1); glVertex2f((GLfloat)x1, (GLfloat)y0);
-            glTexCoord2f((GLfloat)u0, (GLfloat)v1); glVertex2f((GLfloat)x0, (GLfloat)y0);
-            glEnd();
-        }
-    }
-}
-
-void display(void) {
-    glClear(GL_COLOR_BUFFER_BIT);
-    glEnable(GL_TEXTURE_2D);
-
-    frame_counter++;
-    needs_more_frames = 0;
-
-    double left_px, right_px, top_px, bottom_px;
-    get_view_bounds_pixels(&left_px, &right_px, &top_px, &bottom_px);
-
-    int loads_this_frame = 0;
-
-    for (int i = 0; i < tile_count; i++) {
-        if (!tile_intersects_view(&tiles[i], left_px, right_px, top_px, bottom_px)) {
-            continue;
-        }
-
-        if (!tiles[i].texture_loaded) {
-            if (loads_this_frame >= MAX_TILE_LOADS_PER_FRAME) {
-                needs_more_frames = 1;
-                continue;
+            size_t payload_size = (size_t)record.tile_width * (size_t)record.tile_height;
+            if (fseek(fp, (long)payload_size, SEEK_CUR) != 0) {
+                fprintf(stderr, "Failed to skip payload in %s for chunk %d\n", rank_files[file_index].path, record.chunk_id);
+                exit(EXIT_FAILURE);
             }
-            if (load_tile_texture(&tiles[i]) != 0) {
-                continue;
-            }
-            loads_this_frame++;
-        } else {
-            tiles[i].last_used_frame = frame_counter;
         }
-
-        draw_tile(&tiles[i], left_px, right_px, top_px, bottom_px);
+        rewind(fp);
     }
 
-    glDisable(GL_TEXTURE_2D);
-    glutSwapBuffers();
+   
+    int *seen = (int *)calloc((size_t)expected_chunks, sizeof(int));
+   
 
-    if (needs_more_frames) {
-        glutPostRedisplay();
+   
+
+    free(seen);
+    *chunks_out = chunks;
+    *chunk_count_out = chunk_count;
+}
+
+static ChunkRecord **build_chunk_grid(ChunkRecord *chunks, int chunk_count, int expected_chunks) {
+    ChunkRecord **grid = (ChunkRecord **)calloc((size_t)expected_chunks, sizeof(ChunkRecord *));
+    
+    for (int i = 0; i < chunk_count; i++) {
+        grid[chunks[i].chunk_id] = &chunks[i];
+    }
+    return grid;
+}
+
+static int read_tile_row(FILE *fp, const ChunkRecord *chunk, int src_y, uint8_t *row_buffer) {
+    if (src_y < 0 || src_y >= chunk->tile_height) {
+        return 0;
+    }
+
+    long row_offset = chunk->payload_offset + (long)src_y * (long)chunk->tile_width;
+    if (fseek(fp, row_offset, SEEK_SET) != 0) {
+        return 0;
+    }
+
+    size_t expected = (size_t)chunk->tile_width;
+    return fread(row_buffer, 1, expected, fp) == expected;
+}
+
+static void init_hidden_gl_context(int *argc, char **argv) {
+    glutInit(argc, argv);
+    glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
+    glutInitWindowSize(1, 1);
+    glutInitWindowPosition(-10000, -10000);
+    g_window = glutCreateWindow("julia_opengl_export");
+    glutHideWindow();
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+}
+
+static void setup_strip_renderer(int strip_width, int strip_height) {
+    g_strip_width = strip_width;
+    g_strip_height = strip_height;
+
+    glGenTextures(1, &g_input_tex);
+    glBindTexture(GL_TEXTURE_2D, g_input_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, strip_width, strip_height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+
+    glGenTextures(1, &g_color_tex);
+    glBindTexture(GL_TEXTURE_2D, g_color_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, strip_width, strip_height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+
+    glGenFramebuffers(1, &g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_color_tex, 0);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "OpenGL framebuffer incomplete: 0x%x\n", status);
+        exit(EXIT_FAILURE);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+static void destroy_strip_renderer(void) {
+    if (g_fbo != 0) {
+        glDeleteFramebuffers(1, &g_fbo);
+        g_fbo = 0;
+    }
+    if (g_input_tex != 0) {
+        glDeleteTextures(1, &g_input_tex);
+        g_input_tex = 0;
+    }
+    if (g_color_tex != 0) {
+        glDeleteTextures(1, &g_color_tex);
+        g_color_tex = 0;
+    }
+    if (g_window != 0) {
+        glutDestroyWindow(g_window);
+        g_window = 0;
     }
 }
 
-void idle(void) {
-    if (needs_more_frames) {
-        glutPostRedisplay();
-    }
-}
+static void render_rgb_strip_via_opengl(const uint8_t *cpu_rgb, uint8_t *gpu_rgb, int width, int strip_height) {
+    glBindTexture(GL_TEXTURE_2D, g_input_tex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, strip_height, GL_RGB, GL_UNSIGNED_BYTE, cpu_rgb);
 
-void reshape(int w, int h) {
-    window_width = w;
-    window_height = h;
-    glViewport(0, 0, w, h);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glViewport(0, 0, width, strip_height);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_input_tex);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBegin(GL_QUADS);
+        glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
+        glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f);
+        glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f);
+        glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f);
+    glEnd();
+
+    glReadPixels(0, 0, width, strip_height, GL_RGB, GL_UNSIGNED_BYTE, gpu_rgb);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-void keyboard(unsigned char key, int x, int y) {
-    (void)x;
-    (void)y;
-
-    float pan_step = 0.05f / zoom_factor;
-
-    switch (key) {
-        case 'q':
-        case 27:
-            exit(0);
-            break;
-        case '+':
-        case '=':
-            zoom_factor *= 1.25f;
-            if (zoom_factor > max_zoom_factor) {
-                zoom_factor = max_zoom_factor;
-            }
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case ']':
-        case '}':
-            zoom_factor *= 2.0f;
-            if (zoom_factor > max_zoom_factor) {
-                zoom_factor = max_zoom_factor;
-            }
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case '-':
-        case '_':
-            zoom_factor /= 1.25f;
-            if (zoom_factor < 1.0f) {
-                zoom_factor = 1.0f;
-            }
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case '[':
-        case '{':
-            zoom_factor /= 2.0f;
-            if (zoom_factor < 1.0f) {
-                zoom_factor = 1.0f;
-            }
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case 'w':
-        case 'W':
-            pan_y -= pan_step;
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case 's':
-        case 'S':
-            pan_y += pan_step;
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case 'a':
-        case 'A':
-            pan_x -= pan_step;
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case 'd':
-        case 'D':
-            pan_x += pan_step;
-            clamp_pan();
-            glutPostRedisplay();
-            break;
-        case 'r':
-        case 'R':
-            zoom_factor = 1.0f;
-            pan_x = 0.0f;
-            pan_y = 0.0f;
-            glutPostRedisplay();
-            break;
-        case 'j':
-        case 'J': {
-            char outfile[256];
-            snprintf(outfile, sizeof(outfile), "%s_view.jpg", filename ? filename : "julia");
-            save_jpeg(outfile);
-            break;
-        }
-        default:
-            break;
+static void write_jpeg_from_chunks_with_opengl(
+    const char *output_path,
+    const Manifest *manifest,
+    RankFile *rank_files,
+    ChunkRecord **chunk_grid,
+    int chunks_x,
+    int jpeg_quality,
+    int render_strip_height
+) {
+    FILE *out = fopen(output_path, "wb");
+    if (out == NULL) {
+        fail("Failed to open output JPEG");
     }
+
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, out);
+
+    cinfo.image_width = manifest->width;
+    cinfo.image_height = manifest->height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, jpeg_quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    const int strip_height = (render_strip_height > 0) ? render_strip_height : DEFAULT_RENDER_STRIP_HEIGHT;
+    const size_t cpu_rgb_bytes = (size_t)manifest->width * (size_t)strip_height * 3u;
+    const size_t iter_row_capacity = (size_t)manifest->chunk_size;
+
+    uint8_t *cpu_rgb = (uint8_t *)malloc(cpu_rgb_bytes);
+    uint8_t *gpu_rgb = (uint8_t *)malloc(cpu_rgb_bytes);
+    uint8_t *iter_row = (uint8_t *)malloc(iter_row_capacity);
+    if (cpu_rgb == NULL || gpu_rgb == NULL || iter_row == NULL) {
+        fclose(out);
+        free(cpu_rgb);
+        free(gpu_rgb);
+        free(iter_row);
+        fail("Failed to allocate strip buffers");
+    }
+
+    setup_strip_renderer(manifest->width, strip_height);
+
+    for (int strip_y = 0; strip_y < manifest->height; strip_y += strip_height) {
+        const int current_strip_height = ((strip_y + strip_height) <= manifest->height)
+            ? strip_height
+            : (manifest->height - strip_y);
+
+        memset(cpu_rgb, 0, (size_t)manifest->width * (size_t)current_strip_height * 3u);
+
+        for (int local_y = 0; local_y < current_strip_height; local_y++) {
+            int global_y = strip_y + local_y;
+            int chunk_row = global_y / manifest->chunk_size;
+            int src_y = global_y - chunk_row * manifest->chunk_size;
+            uint8_t *dst_row = cpu_rgb + (size_t)local_y * (size_t)manifest->width * 3u;
+
+            for (int chunk_col = 0; chunk_col < chunks_x; chunk_col++) {
+                int chunk_id = chunk_row * chunks_x + chunk_col;
+                ChunkRecord *chunk = chunk_grid[chunk_id];
+                if (chunk == NULL) {
+                    fprintf(stderr, "Missing chunk grid entry for chunk id %d\n", chunk_id);
+                    exit(EXIT_FAILURE);
+                }
+
+                FILE *fp = rank_files[chunk->rank_index].fp;
+                if (!read_tile_row(fp, chunk, src_y, iter_row)) {
+                    fprintf(stderr, "Failed to read row %d from chunk %d in %s\n", src_y, chunk->chunk_id, chunk->path);
+                    exit(EXIT_FAILURE);
+                }
+
+                uint8_t *dst = dst_row + (size_t)chunk->start_x * 3u;
+                for (int local_x = 0; local_x < chunk->tile_width; local_x++) {
+                    iteration_to_rgb(iter_row[local_x], manifest->max_iterations, &dst[0], &dst[1], &dst[2]);
+                    dst += 3;
+                }
+            }
+        }
+
+        render_rgb_strip_via_opengl(cpu_rgb, gpu_rgb, manifest->width, current_strip_height);
+
+        for (int local_y = 0; local_y < current_strip_height; local_y++) {
+            JSAMPROW row_ptr = gpu_rgb + (size_t)local_y * (size_t)manifest->width * 3u;
+            jpeg_write_scanlines(&cinfo, &row_ptr, 1);
+        }
+
+        printf("Rendered and wrote rows %d to %d of %d\n",
+               strip_y,
+               strip_y + current_strip_height - 1,
+               manifest->height - 1);
+        fflush(stdout);
+    }
+
+    destroy_strip_renderer();
+    free(cpu_rgb);
+    free(gpu_rgb);
+    free(iter_row);
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(out);
 }
 
 int main(int argc, char **argv) {
-    if(argc < 2) {
-        fprintf(stderr, "Usage: %s <datafile.bin | tiles_directory | manifest.txt>\n", argv[0]);
-        return 1;
+    const char *tiles_dir = (argc >= 2) ? argv[1] : DEFAULT_TILES_DIR;
+    const char *output_path = (argc >= 3) ? argv[2] : DEFAULT_OUTPUT_JPEG;
+    int jpeg_quality = (argc >= 4) ? atoi(argv[3]) : DEFAULT_JPEG_QUALITY;
+    int render_strip_height = (argc >= 5) ? atoi(argv[4]) : DEFAULT_RENDER_STRIP_HEIGHT;
+
+    if (jpeg_quality < 1) {
+        jpeg_quality = 1;
     }
-    filename = argv[1];
-
-    if(load_input_data(filename) != 0) {
-        return 1;
+    if (jpeg_quality > 100) {
+        jpeg_quality = 100;
+    }
+    if (render_strip_height < 1) {
+        render_strip_height = DEFAULT_RENDER_STRIP_HEIGHT;
     }
 
-    glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_RGB | GLUT_DOUBLE);
-    glutInitWindowSize(window_width, window_height);
-    glutCreateWindow("Julia Set Viewer");
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gpu_max_texture_size);
-    printf("GL_MAX_TEXTURE_SIZE: %d\n", (int)gpu_max_texture_size);
-    printf("Viewer safe tile limit: %d\n", SAFE_MAX_TILE_DIM);
-    glutReshapeFunc(reshape);
-    glutDisplayFunc(display);
-    glutKeyboardFunc(keyboard);
-    glutIdleFunc(idle);
-    printf("Loaded image bounds: %d x %d\n", width, height);
-    printf("Initial zoom factor: %.2f\n", zoom_factor);
-    printf("Indexed tiles: %d\n", tile_count);
-    printf("Large tiles will be cropped to fit GPU texture limits if needed\n");
-    printf("Tile streaming limit: %d new tiles per frame\n", MAX_TILE_LOADS_PER_FRAME);
-    printf("Controls: +/- zoom, [ ] fast zoom, W/A/S/D pan, R reset, J save JPEG, Q or ESC quit\n");
-    printf("Input loader: tiled rank_*.bin viewer enabled\n");
+    char manifest_path[PATH_MAX];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.txt", tiles_dir);
 
-    glutMainLoop();
+    Manifest manifest;
+    parse_manifest(manifest_path, &manifest);
 
-    free_tiles();
+    const int chunks_x = (manifest.width + manifest.chunk_size - 1) / manifest.chunk_size;
+    const int chunks_y = (manifest.height + manifest.chunk_size - 1) / manifest.chunk_size;
+    const int expected_chunks = chunks_x * chunks_y;
+
+    RankFile *rank_files = NULL;
+    int rank_file_count = 0;
+    open_rank_files(tiles_dir, &rank_files, &rank_file_count);
+
+    ChunkRecord *chunks = NULL;
+    int chunk_count = 0;
+    scan_chunks(rank_files, rank_file_count, &chunks, &chunk_count, chunks_x, chunks_y);
+
+    ChunkRecord **chunk_grid = build_chunk_grid(chunks, chunk_count, expected_chunks);
+
+    printf("OpenGL Julia export\n");
+    printf("  tiles_dir=%s\n", tiles_dir);
+    printf("  output=%s\n", output_path);
+    printf("  width=%d\n", manifest.width);
+    printf("  height=%d\n", manifest.height);
+    printf("  chunk_size=%d\n", manifest.chunk_size);
+    printf("  max_iterations=%d\n", manifest.max_iterations);
+    printf("  function=%s\n", manifest.function_name);
+    printf("  c=(%.12f, %.12f)\n", manifest.c_re, manifest.c_im);
+    printf("  strip_height=%d\n", render_strip_height);
+    if (manifest.max_iterations > 255) {
+        printf("  note=stored iteration values are 8-bit, so displayed colors are normalized to 255\n");
+    }
+
+    init_hidden_gl_context(&argc, argv);
+    write_jpeg_from_chunks_with_opengl(
+        output_path,
+        &manifest,
+        rank_files,
+        chunk_grid,
+        chunks_x,
+        jpeg_quality,
+        render_strip_height
+    );
+
+    for (int i = 0; i < rank_file_count; i++) {
+        if (rank_files[i].fp != NULL) {
+            fclose(rank_files[i].fp);
+        }
+    }
+
+    free(rank_files);
+    free(chunk_grid);
+    free(chunks);
+
+    printf("Done. OpenGL-rendered JPEG saved to %s\n", output_path);
     return 0;
 }
